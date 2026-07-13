@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         v4Words - 划词翻译 UserScript
-// @namespace    https://github.com/vlan20/v4words
-// @version      0.1.2
-// @description  更便捷的划词翻译(select translator)，双击即译，支持谷歌翻译、有道词典及剑桥词典，适配Tampermonkey等脚本管理器。
+// @name         PopDict 词窗 - 划词翻译
+// @namespace    https://github.com/vlan20/popdict
+// @version      0.1.3
+// @description  一款简洁轻量的网页划词翻译脚本，双击即译，支持有道词典、剑桥词典和谷歌翻译，适配Tampermonkey脚本管理器。
 // @author       vlan20
 // @license      MIT
 // @match        *://*/*
@@ -12,57 +12,20 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
-// @grant        GM_deleteValue
 // @grant        GM_addStyle
-// @grant        GM_registerMenuCommand
-// @grant        GM_unregisterMenuCommand
 // @connect      translate.googleapis.com
 // @connect      dict.youdao.com
 // @connect      dictionary.cambridge.org
 // @run-at       document-end
-// @downloadURL  https://github.com/vlan20/v4words/raw/main/v4words.user.js
-// @updateURL    https://github.com/vlan20/v4words/raw/main/v4words.user.js
-// @supportURL   https://github.com/vlan20/v4words/issues
+// @downloadURL  https://github.com/vlan20/popdict/raw/main/popdict.user.js
+// @updateURL    https://github.com/vlan20/popdict/raw/main/popdict.user.js
+// @supportURL   https://github.com/vlan20/popdict/issues
 // ==/UserScript==
 
 /*
-更新日期：2025-02-27
-当前版本：0.1.2
-更新说明：
-1. 首次启动脚本时，默认翻译器更改：谷歌翻译->有道词典。
-2. 优化部分外观细节。
-3. 修复在部分网页上，翻译面板显示位置不正确的情况。
-
-使用说明：
-1. 双击选中的文本即可翻译。
-2. 点击标题栏切换翻译器，目前支持谷歌翻译、有道词典及剑桥词典。
-3. 点击音标按钮即可播放发音。
-4. 窗口内单击右键/窗口外单击左键，可关闭翻译窗口。
-*/
-
-/*
-MIT License
-
-Copyright (c) 2025 vlan20
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-*/
+ * Copyright (c) 2025-2026 vlan20
+ * SPDX-License-Identifier: MIT
+ */
 
 (() => {
     'use strict';
@@ -73,21 +36,17 @@ SOFTWARE.
         sourceFontSize: 14, // 原文字体大小
         translationFontSize: 13, // 翻译结果字体大小
         triggerDelay: 150, // 减少触发延迟
-        doubleClickDelay: 250, // 减少双击延迟
-        selectionOverrideDelay: 400, // 减少选择覆盖延迟
+        doubleClickDelay: 250, // 双击判定间隔
         darkModeClass: 'translator-panel-dark',
         panelSpacing: 12, // 减小面板间距
         panelWidth: 300,
         maxPanelHeight: 400,
         titleBarHeight: 40, // 添加标题栏高度配置
         animationDuration: 200, // 添加动画持续时间配置
-        currentTranslator: GM_getValue('defaultTranslator', 'youdao'), // 从GM_getValue读取默认翻译器，默认为有道
         cacheExpiration: 24 * 60 * 60 * 1000, // 缓存过期时间（24小时）
         maxCacheSize: 100, // 最大缓存条目数
     };
 
-    // 全局变量
-    let currentPanel = null;
     let isTranslating = false;
 
     // 翻译缓存系统
@@ -125,22 +84,9 @@ SOFTWARE.
     // 定期清理过期缓存
     setInterval(() => translationCache.cleanup(), CONFIG.cacheExpiration);
 
-    // 清理函数
+    // 新建窗口前移除未固定的旧窗口，固定窗口保留。
     function cleanupPanels() {
-        document.querySelectorAll('.translator-panel').forEach(panel => {
-            if (panel !== currentPanel && !panel.classList.contains('pinned')) panel.remove();
-        });
-    }
-
-    // 创建翻译面板前的检查
-    function beforeCreatePanel() {
-        cleanupPanels();
-        if (currentPanel && !currentPanel.classList.contains('pinned')) {
-            currentPanel.remove();
-            currentPanel = null;
-        }
-        // 从存储中获取默认翻译器
-        CONFIG.currentTranslator = GM_getValue('defaultTranslator', 'youdao');
+        document.querySelectorAll('.translator-panel:not(.pinned)').forEach(panel => panel.remove());
     }
 
     // 添加音频播放功能
@@ -165,6 +111,18 @@ SOFTWARE.
         }
     };
 
+    // 封装 GM_xmlhttpRequest 为 Promise，供各翻译器共用（避免重复的样板代码）
+    const DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+    const gmGet = (url, headers = {}) => new Promise((resolve, reject) => {
+        GM_xmlhttpRequest({
+            method: 'GET',
+            url,
+            headers: { 'User-Agent': DEFAULT_UA, ...headers },
+            onload: resolve,
+            onerror: reject
+        });
+    });
+
     // 翻译器工厂函数
     const createTranslator = (name, translateFn) => ({
         name,
@@ -184,14 +142,7 @@ SOFTWARE.
     const TRANSLATORS = {
         google: createTranslator('谷歌翻译', async (text) => {
             try {
-                const response = await new Promise((resolve, reject) => {
-                    GM_xmlhttpRequest({
-                        method: 'GET',
-                        url: `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-CN&dt=t&q=${encodeURIComponent(text)}`,
-                        headers: {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'},
-                        onload: resolve, onerror: reject
-                    });
-                });
+                const response = await gmGet(`https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-CN&dt=t&q=${encodeURIComponent(text)}`);
                 const result = JSON.parse(response.responseText);
                 if (!result?.[0]?.length) throw new Error('谷歌翻译返回的数据格式不正确');
                 return result[0].map(x => x[0]).join('');
@@ -203,17 +154,10 @@ SOFTWARE.
 
         youdao: createTranslator('有道词典', async (text) => {
             try {
-                const response = await new Promise((resolve, reject) => {
-                    GM_xmlhttpRequest({
-                        method: 'GET',
-                        url: `https://dict.youdao.com/jsonapi?xmlVersion=5.1&jsonversion=2&q=${encodeURIComponent(text)}`,
-                        headers: {
-                            'Referer': 'https://dict.youdao.com',
-                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                        },
-                        onload: resolve, onerror: reject
-                    });
-                });
+                const response = await gmGet(
+                    `https://dict.youdao.com/jsonapi?xmlVersion=5.1&jsonversion=2&q=${encodeURIComponent(text)}`,
+                    { 'Referer': 'https://dict.youdao.com' }
+                );
 
                 const result = JSON.parse(response.responseText);
                 let translation = '';
@@ -255,19 +199,13 @@ SOFTWARE.
 
         cambridge: createTranslator('剑桥词典', async (text) => {
             try {
-                const response = await new Promise((resolve, reject) => {
-                    GM_xmlhttpRequest({
-                        method: 'GET',
-                        url: `https://dictionary.cambridge.org/search/english-chinese-simplified/direct/?q=${encodeURIComponent(text)}`,
-                        headers: {
-                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                            'Accept-Language': 'en-US,en;q=0.5',
-                        },
-                        onload: resolve,
-                        onerror: reject,
-                    });
-                });
+                const response = await gmGet(
+                    `https://dictionary.cambridge.org/search/english-chinese-simplified/direct/?q=${encodeURIComponent(text)}`,
+                    {
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.5'
+                    }
+                );
 
                 const parser = new DOMParser();
                 const doc = parser.parseFromString(response.responseText, 'text/html');
@@ -478,18 +416,17 @@ SOFTWARE.
             overflow: hidden !important;
         }
 
+        /* 下拉菜单展开时允许其超出较矮的翻译面板，避免错误状态下被裁剪 */
+        .translator-panel.dropdown-open {
+            overflow: visible !important;
+        }
+
         /* 拖动时的样式 */
         .translator-panel.dragging {
             transition: none !important;
             opacity: 0.95 !important;
             cursor: move !important;
             pointer-events: none !important; /* 防止拖动时影响其他元素 */
-        }
-
-        /* 标题栏禁用文本选择 */
-        .translator-panel .title-bar {
-            user-select: none !important;
-            cursor: move !important; /* 明确指示可拖动 */
         }
 
         /* 调整内容区域的内边距和滚动条 */
@@ -542,26 +479,22 @@ SOFTWARE.
             display: block !important;
         }
 
-        /* 统一的滚动条样式 - WebKit 浏览器 */
-        .translator-panel .translation-container::-webkit-scrollbar,
+        /* 下拉菜单滚动条样式 - WebKit 浏览器 */
         .translator-panel .dropdown-menu::-webkit-scrollbar {
             width: 3px !important;
             height: 3px !important;
         }
 
-        .translator-panel .translation-container::-webkit-scrollbar-thumb,
         .translator-panel .dropdown-menu::-webkit-scrollbar-thumb {
             background: var(--text-tertiary) !important;
             border-radius: 3px !important;
             transition: background-color 0.2s !important;
         }
 
-        .translator-panel .translation-container::-webkit-scrollbar-thumb:hover,
         .translator-panel .dropdown-menu::-webkit-scrollbar-thumb:hover {
             background: var(--text-secondary) !important;
         }
 
-        .translator-panel .translation-container::-webkit-scrollbar-track,
         .translator-panel .dropdown-menu::-webkit-scrollbar-track {
             background: transparent !important; /* 透明轨道，更简约 */
             border-radius: 3px !important;
@@ -585,7 +518,7 @@ SOFTWARE.
             color: #fff !important;
         }
 
-        /* 调整滚动条样式 */
+        /* 翻译内容区域滚动条样式 */
         .translator-panel .translation-container::-webkit-scrollbar {
             width: 5px !important; /* 增加滚动条宽度，提高可见性 */
             height: 5px !important;
@@ -673,6 +606,7 @@ SOFTWARE.
             border-top-right-radius: 6px !important;
             gap: var(--spacing-md) !important;
             cursor: move !important;
+            user-select: none !important;
             transition: var(--theme-transition) !important;
         }
 
@@ -789,8 +723,8 @@ SOFTWARE.
 
         /* 下拉菜单基础样式 */
         .translator-panel .dropdown-menu {
-            position: fixed !important;
-            top: 0 !important;
+            position: absolute !important;
+            top: calc(100% + 4px) !important;
             left: 0 !important;
             min-width: 150px !important;
             max-height: 300px !important;
@@ -805,8 +739,19 @@ SOFTWARE.
             transform-origin: top left !important;
             transition: opacity 0.15s ease-out, transform 0.15s ease-out, visibility 0.15s !important;
             z-index: 2147483647 !important;
-            margin-top: 4px !important;
-            margin-left: 4px !important;
+            margin: 0 !important;
+        }
+
+        /* 靠近视口底部时向上展开；靠近右侧时向左对齐 */
+        .translator-panel .dropdown-menu.open-upward {
+            top: auto !important;
+            bottom: calc(100% + 4px) !important;
+            transform-origin: bottom left !important;
+        }
+
+        .translator-panel .dropdown-menu.align-right {
+            left: auto !important;
+            right: 0 !important;
         }
 
         /* 移除所有三角形装饰 */
@@ -829,27 +774,6 @@ SOFTWARE.
             visibility: visible !important;
             opacity: 1 !important;
             transform: scale(1) !important;
-        }
-
-        /* 下拉菜单滚动条样式 */
-        .translator-panel .dropdown-menu::-webkit-scrollbar {
-            width: 3px !important; /* 更细的滚动条 */
-            height: 3px !important;
-        }
-
-        .translator-panel .dropdown-menu::-webkit-scrollbar-thumb {
-            background: var(--text-tertiary) !important;
-            border-radius: 3px !important;
-            transition: background-color 0.2s !important;
-        }
-
-        .translator-panel .dropdown-menu::-webkit-scrollbar-thumb:hover {
-            background: var(--text-secondary) !important;
-        }
-
-        .translator-panel .dropdown-menu::-webkit-scrollbar-track {
-            background: transparent !important; /* 透明轨道，更简约 */
-            border-radius: 3px !important;
         }
 
         /* 下拉菜单项样式 */
@@ -1002,17 +926,6 @@ SOFTWARE.
             letter-spacing: 0.5px !important;
         }
 
-        /* 调整释义块样式 */
-        .translator-panel .sense-block {
-            margin: var(--spacing-xs) 0 !important; /* 减少上下间距 */
-            padding: var(--spacing-xs) 0 !important; /* 减少上下内边距 */
-            display: flex !important;
-            gap: var(--spacing-md) !important; /* 减少词性标签和释义内容之间的间距 */
-            align-items: flex-start !important;
-            border-bottom: 1px solid var(--panel-border) !important;
-            transition: var(--theme-transition) !important;
-        }
-
         /* 调整词性标签和释义内容的布局 */
         .translator-panel .def-content {
             flex: 1 !important;
@@ -1070,222 +983,120 @@ SOFTWARE.
         }
     `);
 
-    // 状态管理
+    // 仅保留跨窗口共享且确实需要的状态。
     const state = {
-        currentText: '',
         isDragging: false,
         lastClickTime: 0,
         clickCount: 0,
         ignoreNextSelection: false,
-        allPanels: new Set(),
-        pinnedPanels: new Set(),
-        activePanel: null,
         isSelectingInPanel: false,
-        selectingPanel: null,
-        isRightClickPending: false // 添加右键状态跟踪
+        isRightClickPending: false
     };
 
-    // 工具函数
+    let dragState = null;
+
     const utils = {
         escapeMap: {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'},
         escapeHtml: text => text.replace(/[&<>"']/g, c => utils.escapeMap[c]),
         isDarkMode: () => GM_getValue('darkMode', false),
         toggleDarkMode() {
-            const isDark = !GM_getValue('darkMode', false);
+            const isDark = !this.isDarkMode();
             GM_setValue('darkMode', isDark);
-            document.querySelectorAll('.translator-panel').forEach(p => {
-                p.classList.toggle(CONFIG.darkModeClass, isDark);
-                p.querySelector('.theme-button').className = `theme-button ${isDark ? 'dark' : 'light'}`;
+            document.querySelectorAll('.translator-panel').forEach(panel => {
+                panel.classList.toggle(CONFIG.darkModeClass, isDark);
+                const button = panel.querySelector('.theme-button');
+                if (button) {
+                    button.className = `theme-button ${isDark ? 'dark' : 'light'}`;
+                    button.title = isDark ? '切换亮色模式' : '切换深色模式';
+                }
             });
         },
         debounce(fn, delay) {
             let timer;
             return (...args) => {
                 clearTimeout(timer);
-                timer = setTimeout(() => fn.apply(this, args), delay);
+                timer = setTimeout(() => fn(...args), delay);
             };
-        },
-        addEventHandler(element, eventType, handler, options = {}) {
-            if (!element || !eventType || !handler) return;
-            if (element[`${eventType}Handler`]) element.removeEventListener(eventType, element[`${eventType}Handler`], options);
-            element[`${eventType}Handler`] = handler;
-            element.addEventListener(eventType, handler, options);
-        },
-        removeEventHandler(element, eventType, options = {}) {
-            if (!element || !eventType) return;
-            if (element[`${eventType}Handler`]) {
-                element.removeEventListener(eventType, element[`${eventType}Handler`], options);
-                delete element[`${eventType}Handler`];
-            }
-        },
-        removeAllEventHandlers(element) {
-            if (!element) return;
-            const eventTypes = ['click', 'mousedown', 'mouseup', 'mousemove', 'contextmenu'];
-            eventTypes.forEach(type => utils.removeEventHandler(element, type, {capture: true}));
-            eventTypes.forEach(type => utils.removeEventHandler(element, type, {capture: false}));
-        },
-        createElement(tag, attributes = {}, children = []) {
-            const element = document.createElement(tag);
-            Object.entries(attributes).forEach(([k, v]) => k === 'style' && typeof v === 'object' ? Object.assign(element.style, v) : element.setAttribute(k, v));
-            children.forEach(child => element.appendChild(typeof child === 'string' ? document.createTextNode(child) : child));
-            return element;
         },
         setError(message, targetPanel) {
             const content = targetPanel?.querySelector('.content');
-            if (content) content.innerHTML = `<div class="error">${message}</div>`;
+            if (content) content.innerHTML = `<div class="error">${utils.escapeHtml(message)}</div>`;
         },
-        showPanel(x, y, targetPanel = panel) {
-            if (targetPanel.style.display === 'block') {
-                targetPanel.classList.add('show');
-                return;
-            }
-            const {innerWidth: vw, innerHeight: vh} = window;
-            const {pageXOffset: sx, pageYOffset: sy} = window;
+        showPanel(x, y, targetPanel) {
+            const {innerWidth: vw, innerHeight: vh, scrollX: sx, scrollY: sy} = window;
             const spacing = CONFIG.panelSpacing;
-            const panelWidth = CONFIG.panelWidth;
+            const maxHeight = Math.max(
+                CONFIG.titleBarHeight + spacing,
+                Math.min(CONFIG.maxPanelHeight, vh - spacing * 2)
+            );
 
-            // 先临时显示面板以获取实际高度
             Object.assign(targetPanel.style, {
                 position: 'absolute',
                 left: '-9999px',
                 top: '-9999px',
                 display: 'block',
-                maxHeight: `${CONFIG.maxPanelHeight}px`
+                maxHeight: `${maxHeight}px`
             });
 
-            // 获取实际高度
-            const actualHeight = Math.min(targetPanel.offsetHeight, CONFIG.maxPanelHeight);
-            const contentMaxHeight = actualHeight - CONFIG.titleBarHeight - CONFIG.panelSpacing;
-
-            // 计算面板的水平位置，使用文档坐标
-            const panelX = Math.max(
-                spacing + sx,
-                Math.min(sx + vw - panelWidth - spacing, x)
-            );
-
-            // 计算面板的垂直位置，使用文档坐标
+            // 内容尚未返回时至少按一个小窗口估算位置；结果返回后高度可自然增长。
+            const estimatedHeight = Math.min(Math.max(targetPanel.offsetHeight, 120), maxHeight);
+            const panelX = Math.max(spacing + sx, Math.min(sx + vw - CONFIG.panelWidth - spacing, x));
             const spaceBelow = vh - (y - sy);
             const spaceAbove = y - sy;
+            const panelY = spaceBelow >= estimatedHeight || spaceBelow >= spaceAbove
+                ? y + spacing
+                : y - estimatedHeight - spacing;
 
-            // 确定面板显示位置（上方或下方）
-            const panelY = spaceBelow >= actualHeight || spaceBelow >= spaceAbove ?
-                // 显示在下方，紧贴文本
-                y + spacing :
-                // 显示在上方，紧贴文本
-                y - actualHeight - spacing;
-
-            // 设置最终位置
             Object.assign(targetPanel.style, {
-                position: 'absolute',
                 left: `${panelX}px`,
-                top: `${panelY}px`,
-                maxHeight: `${actualHeight}px`,
-                display: 'block'
+                top: `${Math.max(sy + spacing, panelY)}px`
             });
 
             const content = targetPanel.querySelector('.content');
-            if (content) content.style.maxHeight = `${contentMaxHeight}px`;
+            if (content) content.style.maxHeight = `${maxHeight - CONFIG.titleBarHeight - spacing}px`;
 
             targetPanel.classList.toggle(CONFIG.darkModeClass, this.isDarkMode());
-            setTimeout(() => targetPanel.classList.add('show'), 50);
+            requestAnimationFrame(() => targetPanel.classList.add('show'));
         },
-        hidePanel(targetPanel = panel) {
-            if (!targetPanel || state.pinnedPanels.has(targetPanel)) return;
+        hidePanel(targetPanel) {
+            if (!targetPanel || targetPanel.classList.contains('pinned')) return;
             targetPanel.classList.remove('show');
             setTimeout(() => {
-                if (!targetPanel.classList.contains('show')) targetPanel.style.display = 'none';
+                if (!targetPanel.classList.contains('show')) targetPanel.remove();
             }, CONFIG.animationDuration);
-            if (targetPanel === state.activePanel) state.activePanel = null;
-        },
-        isInvalidElement: e => {
-            try {
-                return e && e instanceof Element && (['INPUT', 'TEXTAREA', 'SELECT', 'OPTION'].includes(e.tagName) || e.isContentEditable || e.closest('[contenteditable]'));
-            } catch (error) {
-                console.error('检查元素有效性时出错:', error);
-                return false;
-            }
         },
         isTranslatable(text) {
-            const t = text.trim().replace(/\s+/g, '');
-            if (!t) return false;
-            if (/[a-zA-Z]/.test(t)) return true;
-            const chinesePattern = /[\u4e00-\u9fff]/;
-            const nonChinesePattern = /[^\u4e00-\u9fff\d\s\p{P}\p{S}]/u;
-            if (chinesePattern.test(t) && !nonChinesePattern.test(t)) return false;
-            if (/^[\d\s\p{P}\p{S}]+$/u.test(t)) return false;
-            return true;
+            const compact = text.trim().replace(/\s+/g, '');
+            if (!compact) return false;
+            if (/[a-zA-Z]/.test(compact)) return true;
+            const hasChinese = /[\u4e00-\u9fff]/.test(compact);
+            const hasOtherLanguage = /[^\u4e00-\u9fff\d\s\p{P}\p{S}]/u.test(compact);
+            if (hasChinese && !hasOtherLanguage) return false;
+            return !/^[\d\s\p{P}\p{S}]+$/u.test(compact);
         },
-        createNewPanel() {
-            const newPanel = panel.cloneNode(true);
-            newPanel.style.display = 'none';
-            document.body.appendChild(newPanel);
-            state.allPanels.add(newPanel);
-            setupPanelEvents(newPanel);
-            return newPanel;
-        },
-        getOrCreatePanel() {
-            if (state.activePanel && !state.pinnedPanels.has(state.activePanel)) return state.activePanel;
-            const availablePanel = Array.from(state.allPanels).find(p => !state.pinnedPanels.has(p) && p.style.display !== 'block');
-            if (availablePanel) {
-                state.activePanel = availablePanel;
-                return availablePanel;
-            }
-            state.activePanel = this.createNewPanel();
-            return state.activePanel;
-        },
-        isClickInPanel: e => e.target.closest('.translator-panel') !== null,
+        isClickInPanel: e => e.target instanceof Element && Boolean(e.target.closest('.translator-panel')),
         preventSelectionTrigger() {
             state.ignoreNextSelection = true;
-            setTimeout(() => state.ignoreNextSelection = false, 100);
-        },
-        updateAllPanels(newTranslator, isDefaultUpdate = false) {
-            const defaultTranslator = GM_getValue('defaultTranslator', 'google');
-            if (!isDefaultUpdate) CONFIG.currentTranslator = newTranslator;
-
-            document.querySelectorAll('.translator-panel').forEach(p => {
-                if (!isDefaultUpdate) p.querySelector('.title').textContent = TRANSLATORS[newTranslator].name;
-
-                p.querySelectorAll('.dropdown-item').forEach(item => {
-                    const key = item.dataset.translator;
-                    const isDefault = key === defaultTranslator;
-                    const isActive = key === CONFIG.currentTranslator;
-
-                    item.className = `dropdown-item${isActive ? ' active' : ''}${isDefault ? ' is-default' : ''}`;
-
-                    const nameSpan = item.querySelector('.translator-name');
-                    if (nameSpan) nameSpan.innerHTML = `${isActive ? '✓ ' : ''}${TRANSLATORS[key].name}`;
-
-                    const defaultSpan = item.querySelector('.set-default');
-                    if (defaultSpan) {
-                        defaultSpan.textContent = isDefault ? '默认' : '设为默认';
-                        if (isDefaultUpdate && isDefault) {
-                            defaultSpan.classList.add('animating');
-                            setTimeout(() => defaultSpan.classList.remove('animating'), 500);
-                        }
-                    }
-                });
-            });
-        },
-        cleanupPanel(targetPanel) {
-            if (!targetPanel) return;
-            this.removeAllEventHandlers(targetPanel);
-            targetPanel.remove();
+            setTimeout(() => { state.ignoreNextSelection = false; }, 100);
         }
     };
 
-    // 翻译功能
-    async function translate(text, targetPanel = panel) {
-        if (!text || !targetPanel) {
-            console.error('翻译参数无效:', { text, targetPanel });
-            throw new Error('翻译参数无效');
-        }
+    function resetPanelSelection() {
+        state.isSelectingInPanel = false;
+        document.body.style.userSelect = '';
+        utils.preventSelectionTrigger();
+    }
+
+    async function translate(text, targetPanel) {
+        if (!text || !targetPanel) throw new Error('翻译参数无效');
 
         const textToTranslate = text.replace(/\n\s*\n/g, '\n\n').replace(/\s*\n\s*/g, '\n').trim();
         if (!textToTranslate) throw new Error('翻译文本为空');
 
-        const translator = TRANSLATORS[CONFIG.currentTranslator];
+        const translator = TRANSLATORS[targetPanel.translatorKey];
         if (!translator) throw new Error('未找到指定的翻译器');
 
+        targetPanel.translationText = textToTranslate;
         const formattedTranslation = await translator.translate(textToTranslate);
         if (!formattedTranslation) throw new Error('翻译结果为空');
 
@@ -1300,41 +1111,27 @@ SOFTWARE.
                 <div class="translation">${formattedTranslation}</div>
             </div>`;
 
-        try {
-            targetPanel.querySelectorAll('.audio-button').forEach(btn => {
-                btn.addEventListener('click', async (e) => {
-                    e.preventDefault(); e.stopPropagation();
-                    const url = btn.getAttribute('data-url');
-                    if (url) {
-                        try {
-                            utils.preventSelectionTrigger();
-                            state.isSelectingInPanel = false;
-                            state.selectingPanel = null;
-                            await audio.play(url);
-                        } catch (err) {
-                            console.error('播放音频失败:', err);
-                            utils.setError('音频播放失败', targetPanel);
-                        }
-                    }
-                });
+        targetPanel.querySelectorAll('.audio-button').forEach(button => {
+            button.addEventListener('click', async e => {
+                e.preventDefault();
+                e.stopPropagation();
+                utils.preventSelectionTrigger();
+                state.isSelectingInPanel = false;
+                const url = button.dataset.url;
+                if (url) await audio.play(url);
             });
-        } catch (err) {
-            console.error('添加音频按钮事件失败:', err);
-        }
+        });
 
         targetPanel.classList.add('show');
     }
 
-    // 创建翻译面板
-    function createTranslatorPanel() {
-        const panel = document.createElement('div');
-        panel.className = 'translator-panel';
-        panel.innerHTML = `<div class="title-bar">
+    function buildPanelHTML(translatorKey) {
+        return `<div class="title-bar">
                 <div class="title-wrapper">
-                    <span class="title">${TRANSLATORS[CONFIG.currentTranslator].name}</span>
+                    <span class="title">${TRANSLATORS[translatorKey].name}</span>
                     <span class="switch-text">（点击切换）</span>
-                <svg class="switch-icon" viewBox="0 0 1024 1024"><path fill="currentColor" d="M884 256h-75c-5.1 0-9.9 2.5-12.9 6.6L512 654.2 227.9 262.6c-3-4.1-7.8-6.6-12.9-6.6h-75c-6.5 0-10.3 7.4-6.5 12.7l352.6 486.1c12.8 17.6 39 17.6 51.7 0l352.6-486.1c3.9-5.3.1-12.7-6.4-12.7z"/></svg>
-                <div class="dropdown-menu"></div>
+                    <svg class="switch-icon" viewBox="0 0 1024 1024"><path fill="currentColor" d="M884 256h-75c-5.1 0-9.9 2.5-12.9 6.6L512 654.2 227.9 262.6c-3-4.1-7.8-6.6-12.9-6.6h-75c-6.5 0-10.3 7.4-6.5 12.7l352.6 486.1c12.8 17.6 39 17.6 51.7 0l352.6-486.1c3.9-5.3.1-12.7-6.4-12.7z"/></svg>
+                    <div class="dropdown-menu"></div>
                 </div>
                 <div class="external-button" title="在新窗口打开翻译"></div>
                 <div class="pin-button unpinned" title="固定窗口"></div>
@@ -1342,69 +1139,50 @@ SOFTWARE.
                 <div class="clear-button" title="关闭所有窗口"></div>
             </div>
             <div class="content"></div>`;
-
-        setupPanelEvents(panel);
-        return panel;
     }
 
-    // 修改事件处理函数
-    const handleSelection = utils.debounce(async (e) => {
+    function createTranslatorPanel() {
+        const targetPanel = document.createElement('div');
+        targetPanel.className = 'translator-panel';
+        targetPanel.translatorKey = GM_getValue('defaultTranslator', 'youdao');
+        targetPanel.translationText = '';
+        targetPanel.innerHTML = buildPanelHTML(targetPanel.translatorKey);
+        setupPanelEvents(targetPanel);
+        return targetPanel;
+    }
+
+    const handleSelection = utils.debounce(async e => {
         if (isTranslating || state.ignoreNextSelection) return;
 
+        const selection = window.getSelection();
+        const text = selection?.toString().trim();
+        if (!text || !utils.isTranslatable(text) || utils.isClickInPanel(e)) return;
+        if (!selection.rangeCount) return;
+
+        isTranslating = true;
+        cleanupPanels();
+        let targetPanel = null;
+
         try {
-            const selection = window.getSelection();
-            if (!selection) {
-                throw new Error('无法获取选中文本');
-            }
+            targetPanel = createTranslatorPanel();
+            document.body.appendChild(targetPanel);
 
-            const text = selection.toString().trim();
-            if (!text || !utils.isTranslatable(text)) return;
-
-            if (e && e.target && e.target.closest('.translator-panel')) return;
-
-            isTranslating = true;
-            beforeCreatePanel();
-
-            try {
-                const panel = createTranslatorPanel();
-                if (!panel) {
-                    throw new Error('创建翻译面板失败');
-                }
-
-                document.body.appendChild(panel);
-                state.allPanels.add(panel);
-                state.activePanel = panel;
-
-                const range = selection.getRangeAt(0);
-                if (!range) {
-                    throw new Error('无法获取选中文本位置');
-                }
-
-                const rect = range.getBoundingClientRect();
-                const scrollX = window.pageXOffset || document.documentElement.scrollLeft;
-                const scrollY = window.pageYOffset || document.documentElement.scrollTop;
-
-                utils.showPanel(rect.left + scrollX, rect.bottom + scrollY, panel);
-                state.currentText = text;
-                await translate(text, panel);
-            } catch (error) {
-                console.error('处理选中文本时出错:', error);
-                if (state.activePanel) {
-                    utils.setError(error.message || '翻译失败，请稍后重试', state.activePanel);
-                }
-            }
+            const rect = selection.getRangeAt(0).getBoundingClientRect();
+            utils.showPanel(rect.left + window.scrollX, rect.bottom + window.scrollY, targetPanel);
+            await translate(text, targetPanel);
         } catch (error) {
-            console.error('选中文本处理失败:', error);
+            console.error('处理选中文本时出错:', error);
+            if (targetPanel) utils.setError(error.message || '翻译失败，请稍后重试', targetPanel);
         } finally {
             isTranslating = false;
         }
     }, CONFIG.triggerDelay);
 
-    // 事件处理器
     const eventHandlers = {
         handleMouseDown(e) {
             if (state.isSelectingInPanel) {
-                e.stopPropagation(); e.preventDefault();
+                e.stopPropagation();
+                e.preventDefault();
                 return;
             }
             if (e.button === 2) {
@@ -1412,19 +1190,29 @@ SOFTWARE.
                 return;
             }
             const now = Date.now();
-            if (now - state.lastClickTime > 250) state.clickCount = 0;
+            if (now - state.lastClickTime > CONFIG.doubleClickDelay) state.clickCount = 0;
             state.clickCount++;
             state.lastClickTime = now;
             if (state.clickCount >= 3) utils.preventSelectionTrigger();
         },
-
         handleMouseUp(e) {
+            if (dragState) {
+                dragState.panel.classList.remove('dragging');
+                dragState = null;
+                state.isDragging = false;
+                utils.preventSelectionTrigger();
+                e.stopPropagation();
+                e.preventDefault();
+                return;
+            }
             if (state.isSelectingInPanel) {
-                e.stopPropagation(); e.preventDefault();
+                resetPanelSelection();
+                e.stopPropagation();
+                e.preventDefault();
                 return;
             }
             if (state.isRightClickPending && e.button === 0) {
-                document.querySelectorAll('.translator-panel:not(.pinned)').forEach(p => utils.hidePanel(p));
+                document.querySelectorAll('.translator-panel:not(.pinned)').forEach(utils.hidePanel);
                 state.isRightClickPending = false;
                 utils.preventSelectionTrigger();
                 return;
@@ -1439,501 +1227,287 @@ SOFTWARE.
             }
             handleSelection(e);
         },
-
         handleOutsideClick(e) {
             if (state.isSelectingInPanel) {
-                e.stopPropagation(); e.preventDefault();
+                e.stopPropagation();
+                e.preventDefault();
                 return;
             }
             if (state.isRightClickPending || state.isDragging || utils.isClickInPanel(e)) return;
-
-            document.querySelectorAll('.translator-panel:not(.pinned)').forEach(p => {
-                p.classList.remove('show');
-                    setTimeout(() => {
-                    if (!p.classList.contains('show')) {
-                        p.style.display = 'none';
-                        if (p !== currentPanel && !p.classList.contains('pinned')) p.remove();
-                        }
-                    }, CONFIG.animationDuration);
-                });
+            document.querySelectorAll('.translator-panel:not(.pinned)').forEach(utils.hidePanel);
         }
     };
 
-    // 注册事件监听器
     document.addEventListener('mousedown', eventHandlers.handleMouseDown, {capture: true, passive: false});
     document.addEventListener('mouseup', eventHandlers.handleMouseUp, {capture: true, passive: false});
     document.addEventListener('click', eventHandlers.handleOutsideClick, {capture: true, passive: false});
-
-    // 添加右键菜单事件处理
     document.addEventListener('contextmenu', e => {
-        if (!e.target.closest('.translator-panel')) state.isRightClickPending = true;
+        if (!(e.target instanceof Element) || !e.target.closest('.translator-panel')) {
+            state.isRightClickPending = true;
+        }
     }, {passive: false});
 
-    // 处理翻译器切换
+    function refreshOpenDropdowns() {
+        document.querySelectorAll('.translator-panel').forEach(panel => panel.refreshDropdown?.());
+    }
+
     function setupTranslatorSwitch(targetPanel) {
         const titleWrapper = targetPanel.querySelector('.title-wrapper');
+        const title = targetPanel.querySelector('.title');
         const switchIcon = targetPanel.querySelector('.switch-icon');
         const dropdownMenu = targetPanel.querySelector('.dropdown-menu');
         targetPanel.isDropdownOpen = false;
 
-        function updateDropdownMenu() {
-            const defaultTranslator = GM_getValue('defaultTranslator', 'google');
-            dropdownMenu.innerHTML = Object.entries(TRANSLATORS)
-                .map(([key, translator]) => `<div class="dropdown-item${key === CONFIG.currentTranslator ? ' active' : ''}${key === defaultTranslator ? ' is-default' : ''}" data-translator="${key}">
-                    <span class="translator-name">${key === CONFIG.currentTranslator ? '✓ ' : ''}${translator.name}</span>
-                        <span class="set-default" title="设为默认翻译器">设为默认</span>
-                </div>`).join('');
-        }
+        const updateDropdownMenu = () => {
+            const defaultTranslator = GM_getValue('defaultTranslator', 'youdao');
+            dropdownMenu.innerHTML = Object.entries(TRANSLATORS).map(([key, translator]) => {
+                const active = key === targetPanel.translatorKey ? ' active' : '';
+                const isDefault = key === defaultTranslator ? ' is-default' : '';
+                const check = active ? '✓ ' : '';
+                return `<div class="dropdown-item${active}${isDefault}" data-translator="${key}">
+                    <span class="translator-name">${check}${translator.name}</span>
+                    <span class="set-default" title="设为默认翻译器">设为默认</span>
+                </div>`;
+            }).join('');
+        };
+        targetPanel.refreshDropdown = updateDropdownMenu;
 
-        const toggleDropdown = (show) => {
+        const toggleDropdown = show => {
             if (show === targetPanel.isDropdownOpen) return;
             targetPanel.isDropdownOpen = show;
             switchIcon.classList.toggle('open', show);
 
             if (show) {
                 updateDropdownMenu();
+                targetPanel.classList.add('dropdown-open');
+                dropdownMenu.classList.remove('open-upward', 'align-right');
                 dropdownMenu.classList.add('show');
-                // 计算下拉菜单的位置，添加边距
+
                 const titleRect = titleWrapper.getBoundingClientRect();
-                dropdownMenu.style.top = `${titleRect.bottom + 4}px`; // 添加 4px 的上边距
-                dropdownMenu.style.left = `${titleRect.left}px`;
-                dropdownMenu.style.display = 'block';
-                dropdownMenu.style.opacity = '1';
-                dropdownMenu.style.transform = 'scale(1)';
+                const openUpward = titleRect.bottom + dropdownMenu.offsetHeight + 8 > window.innerHeight
+                    && titleRect.top >= dropdownMenu.offsetHeight + 8;
+                const alignRight = titleRect.left + dropdownMenu.offsetWidth + 8 > window.innerWidth;
+                dropdownMenu.classList.toggle('open-upward', openUpward);
+                dropdownMenu.classList.toggle('align-right', alignRight);
             } else {
                 dropdownMenu.classList.remove('show');
                 setTimeout(() => {
                     if (!targetPanel.isDropdownOpen) {
                         dropdownMenu.innerHTML = '';
-                        dropdownMenu.style.display = 'none';
-                        dropdownMenu.style.opacity = '0';
-                        dropdownMenu.style.transform = 'scale(0.95)';
+                        dropdownMenu.classList.remove('open-upward', 'align-right');
+                        targetPanel.classList.remove('dropdown-open');
                     }
                 }, 150);
             }
         };
 
-        // 点击标题栏切换下拉菜单
-        utils.addEventHandler(titleWrapper, 'click', (e) => {
+        targetPanel.addEventListener('click', e => {
+            if (!e.target.closest('.title-wrapper') && targetPanel.isDropdownOpen) toggleDropdown(false);
+        });
+
+        titleWrapper.addEventListener('click', e => {
             e.preventDefault();
             e.stopPropagation();
             toggleDropdown(!targetPanel.isDropdownOpen);
-        }, {passive: false});
+        });
 
-        // 点击面板任何地方关闭下拉菜单
-        utils.addEventHandler(targetPanel, 'click', (e) => {
-            if (!e.target.closest('.title-wrapper') && targetPanel.isDropdownOpen) {
-                toggleDropdown(false);
-            }
-        }, {passive: false});
-
-        // 点击下拉菜单项切换翻译器
-        utils.addEventHandler(dropdownMenu, 'click', (e) => {
-            e.stopPropagation(); // 阻止事件冒泡
+        dropdownMenu.addEventListener('click', e => {
+            e.preventDefault();
+            e.stopPropagation();
             const item = e.target.closest('.dropdown-item');
             if (!item) return;
 
-            const translator = item.dataset.translator;
-            if (translator) {
-                if (e.target.closest('.set-default')) {
-                    GM_setValue('defaultTranslator', translator);
-                    updateDropdownMenu();
-                } else {
-                    CONFIG.currentTranslator = translator;
-                    const switchText = targetPanel.querySelector('.switch-text');
-                    switchText.textContent = TRANSLATORS[translator].name;
-                    toggleDropdown(false);
-
-                    // 如果有当前文本，重新翻译
-                    if (state.currentText) {
-                        translate(state.currentText, targetPanel);
-                    }
-                }
-            }
-        }, {passive: false});
-
-        // 移除旧的事件监听器
-        titleWrapper.removeEventListener('click', titleWrapper.clickHandler);
-        dropdownMenu.removeEventListener('click', dropdownMenu.clickHandler);
-
-        // 移除旧的鼠标离开事件监听器
-        targetPanel.removeEventListener('mouseleave', targetPanel.mouseLeaveHandler);
-        titleWrapper.removeEventListener('mouseleave', titleWrapper.mouseLeaveHandler);
-        dropdownMenu.removeEventListener('mouseleave', dropdownMenu.mouseLeaveHandler);
-
-        // 添加新的事件监听器
-        titleWrapper.clickHandler = (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            toggleDropdown(!targetPanel.isDropdownOpen);
-        };
-        titleWrapper.addEventListener('click', titleWrapper.clickHandler);
-
-        dropdownMenu.clickHandler = (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-
-            const item = e.target.closest('.dropdown-item');
-            if (!item) return;
-
-            const setDefaultBtn = e.target.closest('.set-default');
             const translatorKey = item.dataset.translator;
-
-            if (setDefaultBtn) {
-                // 设为默认翻译器，但不改变当前翻译器
+            if (e.target.closest('.set-default')) {
                 GM_setValue('defaultTranslator', translatorKey);
-                utils.updateAllPanels(translatorKey, true);
-            } else if (translatorKey !== CONFIG.currentTranslator) {
-                // 切换当前翻译器并重新翻译
-                utils.updateAllPanels(translatorKey, false);
+                refreshOpenDropdowns();
+                return;
+            }
 
-                // 如果有当前文本，重新翻译
-                if (state.currentText) {
-                    translate(state.currentText, targetPanel);
+            if (translatorKey !== targetPanel.translatorKey) {
+                targetPanel.translatorKey = translatorKey;
+                title.textContent = TRANSLATORS[translatorKey].name;
+                if (targetPanel.translationText) {
+                    translate(targetPanel.translationText, targetPanel).catch(error => {
+                        console.error('切换翻译器失败:', error);
+                        utils.setError(error.message || '翻译失败，请稍后重试', targetPanel);
+                    });
                 }
             }
-
-            // 更新下拉菜单内容但保持打开状态
             updateDropdownMenu();
-        };
-        dropdownMenu.addEventListener('click', dropdownMenu.clickHandler);
+        });
 
-        // 添加鼠标进入事件处理
-        const handleMouseEnter = () => {
-            clearTimeout(targetPanel.dropdownCloseTimer);
-        };
-
-        // 添加鼠标离开事件处理
-        const handleMouseLeave = () => {
-            targetPanel.dropdownCloseTimer = setTimeout(() => {
-            if (targetPanel.isDropdownOpen) {
-                toggleDropdown(false);
-            }
-            }, 100); // 添加小延迟，使过渡更平滑
-        };
-
-        // 为整个面板添加鼠标进入/离开事件
-        targetPanel.addEventListener('mouseenter', handleMouseEnter);
-        targetPanel.addEventListener('mouseleave', handleMouseLeave);
-
-        // 保存事件处理函数引用以便后续清理
-        targetPanel.mouseEnterHandler = handleMouseEnter;
-        targetPanel.mouseLeaveHandler = handleMouseLeave;
+        targetPanel.addEventListener('mouseenter', () => clearTimeout(targetPanel.dropdownCloseTimer));
+        targetPanel.addEventListener('mouseleave', () => {
+            targetPanel.dropdownCloseTimer = setTimeout(() => toggleDropdown(false), 100);
+        });
     }
 
-    // 处理固定按钮点击
-    function handlePinClick(e, targetPanel) {
-        e.preventDefault(); e.stopPropagation();
-        utils.preventSelectionTrigger();
+    function beginPanelDrag(e, targetPanel) {
+        if (e.button !== 0 || !e.target.closest('.title-bar')) return;
+        if (e.target.closest('.title-wrapper, .pin-button, .theme-button, .clear-button, .external-button, .dropdown-menu')) return;
 
-        const pinButton = e.target;
-        const isPinned = state.pinnedPanels.has(targetPanel);
+        const rect = targetPanel.getBoundingClientRect();
+        dragState = {
+            panel: targetPanel,
+            startX: e.clientX,
+            startY: e.clientY,
+            startLeft: rect.left + window.scrollX,
+            startTop: rect.top + window.scrollY,
+            scrollX: window.scrollX,
+            scrollY: window.scrollY
+        };
+        state.isDragging = true;
+        targetPanel.classList.add('dragging');
+        e.preventDefault();
+        e.stopPropagation();
+    }
 
-        if (isPinned) {
-            state.pinnedPanels.delete(targetPanel);
-            targetPanel.classList.remove('pinned');
-            pinButton.className = 'pin-button unpinned';
-            pinButton.title = '固定窗口';
-        } else {
-            state.pinnedPanels.add(targetPanel);
-            targetPanel.classList.add('pinned');
-            pinButton.className = 'pin-button pinned';
-            pinButton.title = '取消固定';
+    // 所有窗口共用一组文档级拖动监听器，避免新窗口覆盖旧窗口的监听器。
+    document.addEventListener('mousemove', e => {
+        if (!dragState) return;
+        const {panel, startX, startY, startLeft, startTop, scrollX, scrollY} = dragState;
+        if (!panel.isConnected) {
+            dragState = null;
+            state.isDragging = false;
+            return;
         }
-    }
 
-    // 设置面板事件
+        const desiredLeft = startLeft + e.clientX - startX + window.scrollX - scrollX;
+        const desiredTop = startTop + e.clientY - startY + window.scrollY - scrollY;
+        const minVisible = CONFIG.titleBarHeight;
+        const viewportLeft = window.scrollX;
+        const viewportTop = window.scrollY;
+
+        panel.style.left = `${Math.max(
+            viewportLeft - panel.offsetWidth + minVisible,
+            Math.min(viewportLeft + window.innerWidth - minVisible, desiredLeft)
+        )}px`;
+        panel.style.top = `${Math.max(
+            viewportTop,
+            Math.min(viewportTop + window.innerHeight - minVisible, desiredTop)
+        )}px`;
+    });
+
     function setupPanelEvents(targetPanel) {
         setupTranslatorSwitch(targetPanel);
 
-        // 初始化固定按钮状态
         const pinButton = targetPanel.querySelector('.pin-button');
-        const isPinned = state.pinnedPanels.has(targetPanel);
-        pinButton.className = `pin-button ${isPinned ? 'pinned' : 'unpinned'}`;
-        pinButton.title = isPinned ? '取消固定' : '固定窗口';
-        utils.addEventHandler(pinButton, 'click', (e) => handlePinClick(e, targetPanel));
-
-        // 初始化主题按钮状态和事件
         const themeButton = targetPanel.querySelector('.theme-button');
+        const externalButton = targetPanel.querySelector('.external-button');
+        const clearButton = targetPanel.querySelector('.clear-button');
         const isDark = utils.isDarkMode();
+
         themeButton.className = `theme-button ${isDark ? 'dark' : 'light'}`;
         themeButton.title = isDark ? '切换亮色模式' : '切换深色模式';
         targetPanel.classList.toggle(CONFIG.darkModeClass, isDark);
 
-        utils.addEventHandler(themeButton, 'click', (e) => {
-            e.preventDefault(); e.stopPropagation();
+        pinButton.addEventListener('click', e => {
+            e.preventDefault();
+            e.stopPropagation();
+            const pinned = targetPanel.classList.toggle('pinned');
+            pinButton.className = `pin-button ${pinned ? 'pinned' : 'unpinned'}`;
+            pinButton.title = pinned ? '取消固定' : '固定窗口';
+        });
+
+        themeButton.addEventListener('click', e => {
+            e.preventDefault();
+            e.stopPropagation();
             utils.toggleDarkMode();
-            document.querySelectorAll('.translator-panel .theme-button').forEach(btn => {
-                btn.title = btn.classList.contains('dark') ? '切换亮色模式' : '切换深色模式';
-            });
         });
 
-        // 初始化清除按钮事件
-        utils.addEventHandler(targetPanel.querySelector('.clear-button'), 'click', (e) => {
-            e.preventDefault(); e.stopPropagation();
-            utils.preventSelectionTrigger();
-
-            // 重置选择状态
-            state.isSelectingInPanel = false;
-            state.selectingPanel = null;
-            document.body.style.userSelect = '';
-
-            // 关闭所有翻译窗口
-            Array.from(document.querySelectorAll('.translator-panel')).forEach(panel => {
-                state.pinnedPanels.delete(panel);
-                panel.classList.remove('pinned', 'show');
-                utils.removeAllEventHandlers(panel);
-                state.allPanels.delete(panel);
-                panel.remove();
-            });
-
-            // 重置所有状态
-            state.activePanel = null;
-            state.currentText = '';
-            state.isSelectingInPanel = false;
-            state.selectingPanel = null;
-            state.isDragging = false;
-            state.dragTarget = null;
-            state.lastClickTime = 0;
-            state.clickCount = 0;
-            state.ignoreNextSelection = false;
-            state.isRightClickPending = false;
-
-            // 重新创建主面板
-            const newPanel = createTranslatorPanel();
-            document.body.appendChild(newPanel);
-            state.allPanels.add(newPanel);
-            currentPanel = newPanel;
-        });
-
-        // 添加面板内选择事件处理
-        utils.addEventHandler(targetPanel, 'mousedown', (e) => {
-            if (e.target.closest('.audio-button')) return;
-            if (e.target.closest('.content')) {
+        targetPanel.addEventListener('mousedown', e => {
+            const inContent = e.target.closest('.content');
+            if (inContent && !e.target.closest('.audio-button')) {
                 const now = Date.now();
-                if (now - state.lastClickTime < 250) {
-                    state.clickCount++;
-                    if (state.clickCount >= 3) {
-                        state.lastClickTime = now;
-                        return;
-                    }
-                } else {
-                    state.clickCount = 1;
-                }
+                state.clickCount = now - state.lastClickTime < CONFIG.doubleClickDelay ? state.clickCount + 1 : 1;
                 state.lastClickTime = now;
-                state.isSelectingInPanel = true;
-                state.selectingPanel = targetPanel;
-                document.body.style.userSelect = 'none';
-                e.stopPropagation();
-            }
-        }, {passive: false});
-
-        // 添加右键菜单事件处理
-        utils.addEventHandler(targetPanel, 'contextmenu', (e) => {
-            const selection = window.getSelection();
-            if (selection && !selection.isCollapsed && e.target.closest('.content')) {
-                e.stopPropagation();
+                if (state.clickCount < 3) {
+                    state.isSelectingInPanel = true;
+                    document.body.style.userSelect = 'none';
+                    e.stopPropagation();
+                }
                 return;
             }
-            e.preventDefault(); e.stopPropagation();
-            document.querySelectorAll('.translator-panel:not(.pinned)').forEach(p => utils.hidePanel(p));
-        }, {passive: false});
+            beginPanelDrag(e, targetPanel);
+        });
 
-        utils.addEventHandler(targetPanel, 'mousemove', e => {
+        targetPanel.addEventListener('mousemove', e => {
             if (state.isSelectingInPanel) e.stopPropagation();
-        }, {passive: false});
+        });
 
-        utils.addEventHandler(targetPanel, 'mouseup', e => {
-            if (state.isSelectingInPanel) {
-                state.isSelectingInPanel = false;
-                state.selectingPanel = null;
-                document.body.style.userSelect = '';
+        targetPanel.addEventListener('contextmenu', e => {
+            const selection = window.getSelection();
+            if (selection?.isCollapsed || !e.target.closest('.content')) {
+                e.preventDefault();
                 e.stopPropagation();
-                utils.preventSelectionTrigger();
+                document.querySelectorAll('.translator-panel:not(.pinned)').forEach(utils.hidePanel);
             }
-        }, {passive: false});
+        });
 
-        // 添加全局鼠标抬起事件处理
-        utils.addEventHandler(document, 'mouseup', e => {
-            if (state.isSelectingInPanel) {
-                state.isSelectingInPanel = false;
-                state.selectingPanel = null;
-                document.body.style.userSelect = '';
-                e.stopPropagation(); e.preventDefault();
-                utils.preventSelectionTrigger();
-            }
-        }, { capture: true, passive: false });
-
-        // 标题栏拖动功能
-        const titleBar = targetPanel.querySelector('.title-bar');
-        targetPanel.dataset.dragInfo = JSON.stringify({startX: 0, startY: 0, startLeft: 0, startTop: 0});
-
-        const handleDragStart = e => {
-            if (!e.target.closest('.title-bar')) return;
-            state.isDragging = true;
-            state.dragTarget = targetPanel;
-
-            const dragInfo = {
-                startX: e.clientX,
-                startY: e.clientY,
-                startLeft: parseFloat(targetPanel.style.left) || 0,
-                startTop: parseFloat(targetPanel.style.top) || 0,
-                scrollX: window.scrollX,
-                scrollY: window.scrollY
-            };
-            targetPanel.dataset.dragInfo = JSON.stringify(dragInfo);
-
-            targetPanel.classList.add('dragging');
-            utils.addEventHandler(document, 'mousemove', handleDragMove, {passive: false});
-            utils.addEventHandler(document, 'mouseup', handleDragEnd, {passive: false});
-            e.preventDefault(); e.stopPropagation();
-        };
-
-        const handleDragMove = e => {
-            if (!state.isDragging || state.dragTarget !== targetPanel) return;
-
-            const dragInfo = JSON.parse(targetPanel.dataset.dragInfo);
-            const dx = e.clientX - dragInfo.startX;
-            const dy = e.clientY - dragInfo.startY;
-            const scrollDX = window.scrollX - dragInfo.scrollX; // 使用scrollX替代pageXOffset
-            const scrollDY = window.scrollY - dragInfo.scrollY; // 使用scrollY替代pageYOffset
-
-            const viewportWidth = window.innerWidth;
-            const viewportHeight = window.innerHeight;
-            const currentPanelWidth = targetPanel.offsetWidth;
-            const currentPanelHeight = targetPanel.offsetHeight;
-            const minVisiblePart = CONFIG.titleBarHeight;
-
-            // 计算新位置，考虑滚动偏移
-            const newX = Math.max(
-                -currentPanelWidth + minVisiblePart,
-                Math.min(viewportWidth + window.scrollX - minVisiblePart,
-                    dragInfo.startLeft + dx + scrollDX)
-            );
-            const newY = Math.max(
-                window.scrollY,
-                Math.min(viewportHeight + window.scrollY - minVisiblePart,
-                    dragInfo.startTop + dy + scrollDY)
-            );
-
-            targetPanel.style.left = `${newX}px`;
-            targetPanel.style.top = `${newY}px`;
-            e.preventDefault(); e.stopPropagation();
-        };
-
-        const handleDragEnd = e => {
-            if (!state.isDragging || state.dragTarget !== targetPanel) return;
-
-            state.isDragging = false;
-            state.dragTarget = null;
-            targetPanel.classList.remove('dragging');
-
-            utils.removeEventHandler(document, 'mousemove');
-            utils.removeEventHandler(document, 'mouseup');
-
-            const dragInfo = JSON.parse(targetPanel.dataset.dragInfo);
-            if (Math.abs(dragInfo.startLeft - parseFloat(targetPanel.style.left)) > 5 ||
-                Math.abs(dragInfo.startTop - parseFloat(targetPanel.style.top)) > 5) {
-                if (!state.pinnedPanels.has(targetPanel)) {
-                    const pinButton = targetPanel.querySelector('.pin-button');
-                    pinButton.className = 'pin-button pinned';
-                    pinButton.title = '取消固定';
-                    targetPanel.classList.add('pinned');
-                    state.pinnedPanels.add(targetPanel);
-                }
-            }
-
-            if (e) {
-                e.preventDefault(); e.stopPropagation();
-            }
-        };
-
-        utils.addEventHandler(targetPanel, 'mousedown', handleDragStart, {passive: false});
-
-        // 初始化外部链接按钮事件
-        utils.addEventHandler(targetPanel.querySelector('.external-button'), 'click', e => {
-            e.preventDefault(); e.stopPropagation();
+        externalButton.addEventListener('click', e => {
+            e.preventDefault();
+            e.stopPropagation();
             utils.preventSelectionTrigger();
-
-            const text = state.currentText;
-            if (!text) return;
-
             const urls = {
-                'google': `https://translate.google.com/?sl=auto&tl=zh-CN&text=${encodeURIComponent(text)}`,
-                'youdao': `https://dict.youdao.com/w/${encodeURIComponent(text)}`,
-                'cambridge': `https://dictionary.cambridge.org/dictionary/english-chinese-simplified/${encodeURIComponent(text)}`
+                google: 'https://translate.google.com/?sl=auto&tl=zh-CN&text=',
+                youdao: 'https://dict.youdao.com/w/',
+                cambridge: 'https://dictionary.cambridge.org/dictionary/english-chinese-simplified/'
             };
+            const url = urls[targetPanel.translatorKey];
+            if (url && targetPanel.translationText) {
+                window.open(url + encodeURIComponent(targetPanel.translationText), '_blank');
+            }
+        });
 
-            const url = urls[CONFIG.currentTranslator];
-            if (url) window.open(url, '_blank');
-        }, {passive: false});
+        clearButton.addEventListener('click', e => {
+            e.preventDefault();
+            e.stopPropagation();
+            document.querySelectorAll('.translator-panel').forEach(panel => panel.remove());
+            if (dragState) dragState.panel.classList.remove('dragging');
+            dragState = null;
+            document.body.style.userSelect = '';
+            Object.assign(state, {
+                isDragging: false,
+                lastClickTime: 0,
+                clickCount: 0,
+                ignoreNextSelection: false,
+                isSelectingInPanel: false,
+                isRightClickPending: false
+            });
+        });
     }
 
-    // 添加滚动事件处理
+    // 页面滚动后，仅在窗口完全离开视口时将其拉回可见区域。
     let scrollTimer = null;
-    utils.addEventHandler(window, 'scroll', () => {
+    window.addEventListener('scroll', () => {
         if (scrollTimer) return;
         scrollTimer = setTimeout(() => {
             scrollTimer = null;
             document.querySelectorAll('.translator-panel:not(.dragging)').forEach(panel => {
-                if (!panel.style.display || panel.style.display === 'none') return;
-
+                if (!panel.isConnected || panel.style.display === 'none') return;
                 const rect = panel.getBoundingClientRect();
-                const viewportWidth = window.innerWidth;
-                const viewportHeight = window.innerHeight;
+                const outside = rect.right < CONFIG.panelSpacing
+                    || rect.left > window.innerWidth - CONFIG.panelSpacing
+                    || rect.bottom < CONFIG.panelSpacing
+                    || rect.top > window.innerHeight - CONFIG.panelSpacing;
+                if (!outside) return;
 
-                // 检查面板是否部分不可见
-                if (rect.right < CONFIG.panelSpacing ||
-                    rect.left > viewportWidth - CONFIG.panelSpacing ||
-                    rect.bottom < CONFIG.panelSpacing ||
-                    rect.top > viewportHeight - CONFIG.panelSpacing) {
-
-                    // 调整位置使面板完全可见
-                    const newLeft = Math.max(
-                        CONFIG.panelSpacing + window.scrollX,
-                        Math.min(
-                            window.scrollX + viewportWidth - panel.offsetWidth - CONFIG.panelSpacing,
-                            rect.left + window.scrollX
-                        )
-                    );
-
-                    const newTop = Math.max(
-                        CONFIG.panelSpacing + window.scrollY,
-                        Math.min(
-                            window.scrollY + viewportHeight - panel.offsetHeight - CONFIG.panelSpacing,
-                            rect.top + window.scrollY
-                        )
-                    );
-
-                    panel.style.left = `${newLeft}px`;
-                    panel.style.top = `${newTop}px`;
-                }
+                panel.style.left = `${Math.max(
+                    CONFIG.panelSpacing + window.scrollX,
+                    Math.min(
+                        window.scrollX + window.innerWidth - panel.offsetWidth - CONFIG.panelSpacing,
+                        rect.left + window.scrollX
+                    )
+                )}px`;
+                panel.style.top = `${Math.max(
+                    CONFIG.panelSpacing + window.scrollY,
+                    Math.min(
+                        window.scrollY + window.innerHeight - panel.offsetHeight - CONFIG.panelSpacing,
+                        rect.top + window.scrollY
+                    )
+                )}px`;
             });
-        }, 100); // 使用节流来优化性能
-    }, { passive: true });
-
-    // 创建主翻译面板
-    const panel = document.createElement('div');
-    panel.className = 'translator-panel';
-    panel.innerHTML = `
-        <div class="title-bar">
-            <div class="title-wrapper">
-                <span class="title">${TRANSLATORS[CONFIG.currentTranslator].name}</span>
-                <span class="switch-text">（点击切换）</span>
-                <svg class="switch-icon" viewBox="0 0 1024 1024">
-                    <path fill="currentColor" d="M884 256h-75c-5.1 0-9.9 2.5-12.9 6.6L512 654.2 227.9 262.6c-3-4.1-7.8-6.6-12.9-6.6h-75c-6.5 0-10.3 7.4-6.5 12.7l352.6 486.1c12.8 17.6 39 17.6 51.7 0l352.6-486.1c3.9-5.3.1-12.7-6.4-12.7z"/>
-                </svg>
-                <div class="dropdown-menu"></div>
-            </div>
-            <div class="external-button" title="在新窗口打开翻译"></div>
-            <div class="pin-button unpinned" title="固定窗口"></div>
-            <div class="theme-button light" title="切换深色模式"></div>
-            <div class="clear-button" title="关闭所有窗口"></div>
-        </div>
-        <div class="content"></div>`;
-    document.body.appendChild(panel);
-    state.allPanels.add(panel);
-
-    // 初始化面板事件
-    setupPanelEvents(panel);
+        }, 100);
+    }, {passive: true});
 })();
