@@ -111,15 +111,38 @@
         }
     };
 
-    // 封装 GM_xmlhttpRequest 为 Promise，供各翻译器共用（避免重复的样板代码）
-    const DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-    const gmGet = (url, headers = {}) => new Promise((resolve, reject) => {
+    // 封装 GM_xmlhttpRequest 为 Promise，并统一处理超时与 HTTP 错误。
+    // 不再伪装固定的旧版 Chrome UA，让脚本管理器使用浏览器当前的真实 UA。
+    const gmGet = (url, headers = {}, options = {}) => new Promise((resolve, reject) => {
         GM_xmlhttpRequest({
             method: 'GET',
             url,
-            headers: { 'User-Agent': DEFAULT_UA, ...headers },
-            onload: resolve,
-            onerror: reject
+            headers,
+            timeout: 15000,
+            anonymous: false,
+            ...options,
+            onload(response) {
+                const status = Number(response.status) || 0;
+                if ((status >= 200 && status < 300) || (status === 0 && response.responseText)) {
+                    resolve(response);
+                    return;
+                }
+
+                const error = new Error(`HTTP ${status || '未知状态'}`);
+                error.status = status;
+                error.finalUrl = response.finalUrl || url;
+                error.responseText = response.responseText || '';
+                reject(error);
+            },
+            onerror(response) {
+                const error = new Error('网络请求失败');
+                error.status = Number(response?.status) || 0;
+                error.finalUrl = response?.finalUrl || url;
+                reject(error);
+            },
+            ontimeout() {
+                reject(new Error('请求超时'));
+            }
         });
     });
 
@@ -199,13 +222,19 @@
 
         cambridge: createTranslator('剑桥词典', async (text) => {
             try {
-                const response = await gmGet(
-                    `https://dictionary.cambridge.org/search/english-chinese-simplified/direct/?q=${encodeURIComponent(text)}`,
-                    {
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                        'Accept-Language': 'en-US,en;q=0.5'
-                    }
-                );
+                const response = await new Promise((resolve, reject) => {
+                    GM_xmlhttpRequest({
+                        method: 'GET',
+                        url: `https://dictionary.cambridge.org/search/english-chinese-simplified/direct/?q=${encodeURIComponent(text)}`,
+                        headers: {
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                            'Accept-Language': 'en-US,en;q=0.5',
+                        },
+                        onload: resolve,
+                        onerror: reject,
+                    });
+                });
 
                 const parser = new DOMParser();
                 const doc = parser.parseFromString(response.responseText, 'text/html');
@@ -324,293 +353,115 @@
 
     // 添加样式
     GM_addStyle(`
-        /* ================ */
-        /* 1. CSS 变量定义 */
-        /* ================ */
+        /* 主题变量与面板基础 */
         .translator-panel {
-            /* 基础颜色 */
-            --panel-bg: #ffffff;
+            --panel-bg: #fff;
             --panel-text: #2c3e50;
             --panel-border: #e2e8f0;
-            --panel-shadow: rgba(0,0,0,0.1);
-
-            /* 标题栏颜色 */
+            --panel-shadow: rgba(0, 0, 0, 0.1);
             --title-bg: #f8fafc;
             --title-text: #334155;
             --title-border: #e2e8f0;
-
-            /* 次要文本颜色 */
+            --switch-hover-bg: #e2e8f0;
             --text-secondary: #475569;
             --text-tertiary: #64748b;
-
-            /* 交互颜色 */
             --hover-bg: #f1f5f9;
             --active-link: #3b82f6;
-            --success: #22c55e;
             --error: #ef4444;
-
-            /* 布局尺寸 */
             --spacing-xs: 2px;
             --spacing-sm: 4px;
             --spacing-md: 6px;
             --spacing-lg: 8px;
             --spacing-xl: 12px;
-
-            /* 字体大小 */
             --font-xs: 10px;
             --font-sm: 12px;
-            --font-md: 13px;
             --font-lg: 14px;
             --font-xl: 16px;
-
-            /* 过渡效果 */
             --theme-transition: background-color 0.15s ease-out,
-                                background-image 0.15s ease-out,
                                 color 0.15s ease-out,
-                                border-color 0.15s ease-out,
-                                border-bottom-color 0.15s ease-out;
+                                border-color 0.15s ease-out;
+
+            position: absolute !important;
+            z-index: 2147483647 !important;
+            display: none;
+            max-width: ${CONFIG.panelWidth}px !important;
+            max-height: 80vh !important;
+            overflow: hidden !important;
+            padding: var(--spacing-md) !important;
+            border: 1px solid var(--panel-border) !important;
+            border-radius: 6px !important;
+            background: var(--panel-bg) !important;
+            box-shadow: 0 4px 12px var(--panel-shadow) !important;
+            color: var(--panel-text) !important;
+            font-size: ${CONFIG.fontSize}px !important;
+            line-height: 1.5 !important;
+            opacity: 0;
+            transform: translateY(-10px);
+            transition: var(--theme-transition), opacity 0.3s, transform 0.3s !important;
         }
 
-        /* 深色模式变量 */
         .translator-panel.translator-panel-dark {
             --panel-bg: #1a1a1a;
             --panel-text: #e0e0e0;
             --panel-border: #333;
-            --panel-shadow: rgba(0,0,0,0.3);
-
+            --panel-shadow: rgba(0, 0, 0, 0.3);
             --title-bg: #2c2c2c;
             --title-text: #e0e0e0;
             --title-border: #333;
-
+            --switch-hover-bg: rgba(255, 255, 255, 0.16);
             --text-secondary: #999;
             --text-tertiary: #888;
-
             --hover-bg: rgba(255, 255, 255, 0.1);
             --active-link: #4a9eff;
-            --success: #73d13d;
             --error: #ff7875;
         }
 
-        /* ================ */
-        /* 2. 基础面板样式 */
-        /* ================ */
-        .translator-panel {
-            font-size: ${CONFIG.fontSize}px !important;
-            line-height: 1.5 !important;
-            color: var(--panel-text) !important;
-            background: var(--panel-bg) !important;
-            border: 1px solid var(--panel-border) !important;
-            border-radius: 6px !important;
-            padding: var(--spacing-md) !important;
-            box-shadow: 0 4px 12px var(--panel-shadow) !important;
-            max-width: ${CONFIG.panelWidth}px !important;
-            position: absolute !important; /* 使用absolute定位，相对于文档定位 */
-            z-index: 2147483647 !important;
-            display: none;
-            opacity: 0;
-            transform: translateY(-10px);
-            transition: var(--theme-transition),
-                        opacity 0.3s,
-                        transform 0.3s !important;
-            max-height: 80vh !important;
-            overflow: hidden !important;
-        }
-
-        /* 下拉菜单展开时允许其超出较矮的翻译面板，避免错误状态下被裁剪 */
-        .translator-panel.dropdown-open {
-            overflow: visible !important;
-        }
-
-        /* 拖动时的样式 */
-        .translator-panel.dragging {
-            transition: none !important;
-            opacity: 0.95 !important;
-            cursor: move !important;
-            pointer-events: none !important; /* 防止拖动时影响其他元素 */
-        }
-
-        /* 调整内容区域的内边距和滚动条 */
-        .translator-panel .content {
-            position: relative !important;
-            overflow: visible !important; /* 修改为visible，让子元素的滚动条可见 */
-            display: flex !important;
-            flex-direction: column !important;
-            height: auto !important; /* 修改为auto，根据内容自动调整高度 */
-            max-height: calc(80vh - ${CONFIG.titleBarHeight}px) !important; /* 限制最大高度，减去标题栏高度 */
-        }
-
-        /* 源文本容器样式 */
-        .translator-panel .source-text-container {
-            position: sticky !important;
-            top: 0 !important;
-            z-index: 1 !important;
-            background: var(--panel-bg) !important;
-            border-bottom: 1px solid var(--panel-border) !important;
-            margin: calc(-1 * var(--spacing-md)) calc(-1 * var(--spacing-md)) 0 !important;
-            padding: var(--spacing-md) var(--spacing-lg) var(--spacing-md) calc(var(--spacing-lg) + var(--spacing-sm)) !important;
-            transition: var(--theme-transition) !important;
-        }
-
-        /* 源文本样式 */
-        .translator-panel .source-text {
-            color: var(--text-secondary) !important;
-            font-size: ${CONFIG.sourceFontSize}px !important;
-            line-height: 1.5 !important;
-            user-select: text !important;
-            word-wrap: break-word !important; /* 确保长单词换行 */
-            overflow-wrap: break-word !important; /* 现代浏览器的单词换行 */
-            white-space: pre-wrap !important; /* 保留换行但允许自动换行 */
-        }
-
-        .translator-panel .source-text strong {
-            color: var(--panel-text) !important;
-            font-weight: 600 !important;
-        }
-
-        /* 翻译内容容器样式 */
-        .translator-panel .translation-container {
-            flex: 1 !important;
-            overflow-y: auto !important;
-            padding: var(--spacing-md) var(--spacing-md) !important;
-            max-height: calc(80vh - ${CONFIG.titleBarHeight}px - 100px) !important;
-            word-wrap: break-word !important;
-            overflow-wrap: break-word !important;
-            white-space: normal !important;
-            display: block !important;
-        }
-
-        /* 下拉菜单滚动条样式 - WebKit 浏览器 */
-        .translator-panel .dropdown-menu::-webkit-scrollbar {
-            width: 3px !important;
-            height: 3px !important;
-        }
-
-        .translator-panel .dropdown-menu::-webkit-scrollbar-thumb {
-            background: var(--text-tertiary) !important;
-            border-radius: 3px !important;
-            transition: background-color 0.2s !important;
-        }
-
-        .translator-panel .dropdown-menu::-webkit-scrollbar-thumb:hover {
-            background: var(--text-secondary) !important;
-        }
-
-        .translator-panel .dropdown-menu::-webkit-scrollbar-track {
-            background: transparent !important; /* 透明轨道，更简约 */
-            border-radius: 3px !important;
-        }
-
-        /* 翻译结果样式 */
-        .translator-panel .translation {
-            color: var(--panel-text) !important;
-            font-size: ${CONFIG.translationFontSize}px !important;
-            line-height: 1.5 !important;
-            user-select: text !important;
-            word-wrap: break-word !important; /* 确保长单词换行 */
-            overflow-wrap: break-word !important; /* 现代浏览器的单词换行 */
-            white-space: normal !important; /* 允许正常换行 */
-            max-width: 100% !important; /* 确保不超出容器宽度 */
-            overflow: visible !important; /* 确保内容不被截断 */
-        }
-
-        /* 深色模式下的源文本样式调整 */
-        .translator-panel.translator-panel-dark .source-text strong {
-            color: #fff !important;
-        }
-
-        /* 翻译内容区域滚动条样式 */
-        .translator-panel .translation-container::-webkit-scrollbar {
-            width: 5px !important; /* 增加滚动条宽度，提高可见性 */
-            height: 5px !important;
-        }
-
-        .translator-panel .translation-container::-webkit-scrollbar-thumb {
-            background: var(--text-tertiary) !important;
-            border-radius: 4px !important;
-            transition: background-color 0.2s !important;
-        }
-
-        .translator-panel .translation-container::-webkit-scrollbar-thumb:hover {
-            background: var(--text-secondary) !important;
-        }
-
-        .translator-panel .translation-container::-webkit-scrollbar-track {
-            background: var(--hover-bg) !important; /* 轻微可见的轨道 */
-            border-radius: 4px !important;
-        }
-
-        /* 确保词性标签和音标也可以选择 */
-        .translator-panel .pos-tag,
-        .translator-panel .phonetic-item {
-            user-select: text !important;
-            margin-bottom: var(--spacing-xs) !important; /* 减少音标项的下边距 */
-        }
-
-        /* 调整释义块样式 */
-        .translator-panel .sense-block {
-            margin: var(--spacing-xs) 0 !important; /* 减少上下间距 */
-            padding: var(--spacing-xs) 0 !important; /* 减少上下内边距 */
-            display: flex !important;
-            gap: var(--spacing-md) !important; /* 减少词性标签和释义内容之间的间距 */
-            align-items: flex-start !important;
-            border-bottom: 1px solid var(--panel-border) !important;
-            transition: var(--theme-transition) !important;
-        }
-
-        .sense-block:first-child {
-            margin-top: 0 !important;
-        }
-
-        .sense-block:last-child {
-            margin-bottom: 0 !important;
-            border-bottom: none !important;
-        }
-
-        /* 调整音标项样式 */
-        .phonetic-item {
-            display: flex !important;
-            align-items: center !important;
-            gap: var(--spacing-xs) !important; /* 减少间距 */
-            color: var(--text-secondary) !important;
-            padding: var(--spacing-xs) var(--spacing-sm) !important;
-            white-space: nowrap !important;
-        }
-
-        /* 基础重置样式 */
+        /* 隔离宿主网页样式；必须放在组件规则之前 */
         .translator-panel * {
             all: revert;
             box-sizing: border-box !important;
             margin: 0 !important;
             padding: 0 !important;
+            color: inherit !important;
             font-family: inherit !important;
             line-height: inherit !important;
-            color: inherit !important;
             pointer-events: auto !important;
         }
 
-        /* ================ */
-        /* 3. 布局组件样式 */
-        /* ================ */
+        .translator-panel.show {
+            opacity: 1 !important;
+            transform: translateY(0) !important;
+        }
 
-        /* 标题栏 */
+        .translator-panel.dropdown-open {
+            overflow: visible !important;
+        }
+
+        .translator-panel.dragging {
+            cursor: move !important;
+            opacity: 0.95 !important;
+            pointer-events: none !important;
+            transition: none !important;
+        }
+
+        /* 标题栏与翻译器切换 */
         .translator-panel .title-bar {
             position: relative !important;
             display: flex !important;
             align-items: center !important;
-            justify-content: space-between !important;
-            border-bottom: 1px solid var(--title-border) !important;
-            padding: var(--spacing-xs) var(--spacing-md) !important;
-            margin: calc(-1 * var(--spacing-md)) calc(-1 * var(--spacing-md)) var(--spacing-md) calc(-1 * var(--spacing-md)) !important;
-            background-color: var(--title-bg) !important;
-            border-top-left-radius: 6px !important;
-            border-top-right-radius: 6px !important;
+            justify-content: flex-start !important;
             gap: var(--spacing-md) !important;
+            min-width: 0 !important;
+            margin: calc(-1 * var(--spacing-md)) calc(-1 * var(--spacing-md)) var(--spacing-md) !important;
+            padding: var(--spacing-xs) var(--spacing-md) !important;
+            border-bottom: 1px solid var(--title-border) !important;
+            border-radius: 6px 6px 0 0 !important;
+            background: var(--title-bg) !important;
             cursor: move !important;
             user-select: none !important;
             transition: var(--theme-transition) !important;
         }
 
-        /* 标题包装器和按钮基础样式 */
         .translator-panel .title-wrapper,
         .translator-panel .theme-button,
         .translator-panel .pin-button,
@@ -619,35 +470,70 @@
             display: flex !important;
             align-items: center !important;
             cursor: pointer !important;
-            transition: all 0.2s !important;
+            transition: background-color 0.2s, opacity 0.2s !important;
         }
 
-        /* 标题包装器特有样式 */
         .translator-panel .title-wrapper {
+            position: relative !important;
+            display: inline-flex !important;
+            flex: 0 0 auto !important;
+            width: max-content !important;
             gap: var(--spacing-sm) !important;
-            padding: var(--spacing-xs) var(--spacing-lg) !important;
-            border-radius: var(--spacing-sm) !important;
-            width: fit-content !important; /* 使用fit-content替代固定宽度 */
             margin-right: auto !important;
-            position: relative !important; /* 添加相对定位，作为下拉菜单的参考点 */
+            padding: var(--spacing-xs) var(--spacing-lg) !important;
+            border: 0 !important;
+            border-radius: var(--spacing-sm) !important;
+            background: transparent !important;
         }
 
-        .translator-panel .title-wrapper:hover {
-            background-color: var(--hover-bg) !important;
+        .translator-panel .title-wrapper:hover,
+        .translator-panel.dropdown-open .title-wrapper {
+            background: var(--switch-hover-bg) !important;
         }
 
-        /* 按钮共享样式 */
+        .translator-panel .title,
+        .translator-panel .switch-text {
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+            white-space: nowrap !important;
+            font-size: var(--font-sm) !important;
+        }
+
+        .translator-panel .title {
+            color: var(--title-text) !important;
+            font-weight: 500 !important;
+        }
+
+        .translator-panel .switch-text {
+            color: var(--text-tertiary) !important;
+            opacity: 0.8 !important;
+        }
+
+        .translator-panel .switch-icon {
+            flex: 0 0 auto !important;
+            width: 12px !important;
+            height: 12px !important;
+            margin-left: var(--spacing-sm) !important;
+            transform: rotate(0deg) !important;
+            transition: transform 0.2s !important;
+        }
+
+        .translator-panel .switch-icon.open {
+            transform: rotate(180deg) !important;
+        }
+
+        /* 标题栏图标按钮 */
         .translator-panel .theme-button,
         .translator-panel .pin-button,
         .translator-panel .clear-button,
         .translator-panel .external-button {
+            flex: 0 0 var(--font-xl) !important;
+            justify-content: center !important;
             width: var(--font-xl) !important;
             height: var(--font-xl) !important;
-            justify-content: center !important;
+            color: var(--title-text) !important;
             font-size: var(--font-lg) !important;
-            opacity: 0.6 !important;
-            display: flex !important;
-            align-items: center !important;
+            opacity: 0.62 !important;
         }
 
         .translator-panel .theme-button:hover,
@@ -657,92 +543,63 @@
             opacity: 1 !important;
         }
 
-        /* 按钮图标 */
-        .translator-panel .pin-button::after {
-            content: "" !important;
-            display: inline-block !important;
-            width: 16px !important;
-            height: 16px !important;
-            background-size: contain !important;
-            background-repeat: no-repeat !important;
-            background-position: center !important;
-        }
-        .translator-panel .pin-button.unpinned::after {
-            background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="7" r="4"/><path d="M12 12v9"/></svg>') !important;
-        }
-        .translator-panel .pin-button.pinned::after {
-            background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="7" r="4" fill="currentColor"/><path d="M12 12v9"/></svg>') !important;
-        }
-        .translator-panel.translator-panel-dark .pin-button.unpinned::after {
-            background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="%23ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="7" r="4"/><path d="M12 12v9"/></svg>') !important;
-        }
-        .translator-panel.translator-panel-dark .pin-button.pinned::after {
-            background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="%23ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="7" r="4" fill="%23ffffff"/><path d="M12 12v9"/></svg>') !important;
-        }
-        .translator-panel .theme-button::after {
-            content: "" !important;
-            display: inline-block !important;
-            width: 16px !important;
-            height: 16px !important;
-            background-size: contain !important;
-            background-repeat: no-repeat !important;
-            background-position: center !important;
-        }
-        .translator-panel .theme-button.light::after {
-            background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>') !important;
-        }
-        .translator-panel .theme-button.dark::after {
-            background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="%23ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>') !important;
-        }
-        .translator-panel .clear-button::after {
-            content: "" !important;
-            display: inline-block !important;
-            width: 16px !important;
-            height: 16px !important;
-            background-size: contain !important;
-            background-repeat: no-repeat !important;
-            background-position: center !important;
-            background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3l18 18M3 21l18-18M12 12v.01"/></svg>') !important;
-        }
-        .translator-panel.translator-panel-dark .clear-button::after {
-            background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="%23ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3l18 18M3 21l18-18M12 12v.01"/></svg>') !important;
-        }
+        .translator-panel .theme-button::after,
+        .translator-panel .pin-button::after,
+        .translator-panel .clear-button::after,
         .translator-panel .external-button::after {
             content: "" !important;
-            display: inline-block !important;
+            display: block !important;
             width: 16px !important;
             height: 16px !important;
-            background-size: contain !important;
-            background-repeat: no-repeat !important;
-            background-position: center !important;
-            background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>') !important;
-        }
-        .translator-panel.translator-panel-dark .external-button::after {
-            background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="%23ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>') !important;
+            background: currentColor !important;
+            -webkit-mask: var(--icon) center / contain no-repeat !important;
+            mask: var(--icon) center / contain no-repeat !important;
         }
 
-        /* 下拉菜单基础样式 */
+        .translator-panel .pin-button.unpinned {
+            --icon: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="7" r="4"/><path d="M12 12v9"/></svg>');
+        }
+
+        .translator-panel .pin-button.pinned {
+            --icon: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="7" r="4" fill="black"/><path d="M12 12v9"/></svg>');
+        }
+
+        .translator-panel .theme-button.light {
+            --icon: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>');
+        }
+
+        .translator-panel .theme-button.dark {
+            --icon: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>');
+        }
+
+        .translator-panel .clear-button {
+            --icon: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round"><path d="M3 3l18 18M3 21L21 3"/></svg>');
+        }
+
+        .translator-panel .external-button {
+            --icon: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6M10 14L21 3"/></svg>');
+        }
+
+        /* 翻译器下拉菜单 */
         .translator-panel .dropdown-menu {
             position: absolute !important;
             top: calc(100% + 4px) !important;
             left: 0 !important;
+            z-index: 2147483647 !important;
             min-width: 150px !important;
             max-height: 300px !important;
             overflow-y: auto !important;
-            background: var(--panel-bg) !important;
             border: 1px solid var(--panel-border) !important;
             border-radius: 6px !important;
+            background: var(--panel-bg) !important;
             box-shadow: 0 2px 8px var(--panel-shadow) !important;
             opacity: 0 !important;
             visibility: hidden !important;
             transform: scale(0.95) !important;
             transform-origin: top left !important;
             transition: opacity 0.15s ease-out, transform 0.15s ease-out, visibility 0.15s !important;
-            z-index: 2147483647 !important;
-            margin: 0 !important;
         }
 
-        /* 靠近视口底部时向上展开；靠近右侧时向左对齐 */
         .translator-panel .dropdown-menu.open-upward {
             top: auto !important;
             bottom: calc(100% + 4px) !important;
@@ -750,50 +607,43 @@
         }
 
         .translator-panel .dropdown-menu.align-right {
-            left: auto !important;
             right: 0 !important;
+            left: auto !important;
         }
 
-        /* 移除所有三角形装饰 */
+        .translator-panel .dropdown-menu.show {
+            visibility: visible !important;
+            opacity: 1 !important;
+            transform: scale(1) !important;
+        }
+
         .translator-panel .dropdown-menu::before,
         .translator-panel .dropdown-menu::after,
         .translator-panel .title-wrapper::before,
         .translator-panel .title-wrapper::after,
         .translator-panel .title-bar::before,
         .translator-panel .title-bar::after {
-            display: none !important;
             content: none !important;
-            border: none !important;
-            clip-path: none !important;
-            background: none !important;
+            display: none !important;
         }
 
-        /* 下拉菜单显示状态 */
-        .translator-panel .dropdown-menu.show {
-            display: block !important;
-            visibility: visible !important;
-            opacity: 1 !important;
-            transform: scale(1) !important;
-        }
-
-        /* 下拉菜单项样式 */
         .translator-panel .dropdown-item {
-            padding: var(--spacing-md) var(--spacing-xl) !important;
-            cursor: pointer !important;
-            font-size: var(--font-sm) !important;
-            color: var(--panel-text) !important;
+            position: relative !important;
             display: flex !important;
             align-items: center !important;
             justify-content: space-between !important;
+            padding: var(--spacing-md) var(--spacing-xl) !important;
+            color: var(--panel-text) !important;
+            font-size: var(--font-sm) !important;
             white-space: nowrap !important;
-            position: relative !important;
+            cursor: pointer !important;
         }
 
         .translator-panel .dropdown-item:hover {
-            background-color: var(--hover-bg) !important;
+            background: var(--hover-bg) !important;
         }
 
-        .translator-panel .dropdown-item .translator-name {
+        .translator-panel .translator-name {
             display: flex !important;
             align-items: center !important;
             gap: var(--spacing-sm) !important;
@@ -805,181 +655,263 @@
 
         .translator-panel .dropdown-item.is-default .translator-name::after {
             content: '默认' !important;
-            font-size: var(--font-xs) !important;
-            font-weight: normal !important;
+            margin-left: var(--spacing-sm) !important;
             padding: 2px 4px !important;
             border-radius: 3px !important;
             background: var(--text-tertiary) !important;
             color: var(--panel-bg) !important;
-            margin-left: var(--spacing-sm) !important;
+            font-size: var(--font-xs) !important;
+            font-weight: 400 !important;
             opacity: 0.8 !important;
         }
 
-        .translator-panel .dropdown-item .set-default {
-            opacity: 0 !important;
-            transition: all 0.2s !important;
-            color: var(--text-tertiary) !important;
+        .translator-panel .set-default {
             padding: var(--spacing-xs) var(--spacing-sm) !important;
             border-radius: var(--spacing-xs) !important;
+            color: var(--text-tertiary) !important;
             font-size: var(--font-xs) !important;
+            opacity: 0 !important;
+            transition: color 0.2s, background-color 0.2s, opacity 0.2s !important;
         }
 
         .translator-panel .dropdown-item:hover .set-default {
             opacity: 1 !important;
         }
 
-        .translator-panel .dropdown-item .set-default:hover {
+        .translator-panel .set-default:hover {
+            background: var(--hover-bg) !important;
             color: var(--active-link) !important;
-            background-color: var(--hover-bg) !important;
         }
 
         .translator-panel .dropdown-item.is-default .set-default {
             display: none !important;
         }
 
-        /* 文本样式 */
-        .translator-panel .title {
-            font-size: var(--font-sm) !important;
-            font-weight: 500 !important;
-            color: var(--title-text) !important;
-            white-space: nowrap !important;
+        /* 翻译内容 */
+        .translator-panel .content {
+            position: relative !important;
+            display: flex !important;
+            flex-direction: column !important;
+            height: auto !important;
+            max-height: calc(80vh - ${CONFIG.titleBarHeight}px) !important;
+            overflow: visible !important;
         }
 
-        .translator-panel .switch-text {
-            font-size: var(--font-sm) !important;
-            color: var(--text-tertiary) !important;
-            opacity: 0.8 !important;
-            white-space: nowrap !important;
+        .translator-panel .source-text-container {
+            position: sticky !important;
+            top: 0 !important;
+            z-index: 1 !important;
+            margin: calc(-1 * var(--spacing-md)) calc(-1 * var(--spacing-md)) 0 !important;
+            padding: var(--spacing-md) var(--spacing-lg) var(--spacing-md) calc(var(--spacing-lg) + var(--spacing-sm)) !important;
+            border-bottom: 1px solid var(--panel-border) !important;
+            background: var(--panel-bg) !important;
+            transition: var(--theme-transition) !important;
         }
 
-        /* 错误状态 */
+        .translator-panel .source-text,
+        .translator-panel .translation,
+        .translator-panel .def-content {
+            overflow-wrap: anywhere !important;
+        }
+
+        .translator-panel .source-text {
+            color: var(--text-secondary) !important;
+            font-size: ${CONFIG.sourceFontSize}px !important;
+            white-space: pre-wrap !important;
+            user-select: text !important;
+        }
+
+        .translator-panel .source-text strong {
+            color: var(--panel-text) !important;
+            font-weight: 600 !important;
+        }
+
+        .translator-panel .translation-container {
+            display: block !important;
+            flex: 1 !important;
+            max-height: calc(80vh - ${CONFIG.titleBarHeight}px - 100px) !important;
+            overflow-y: auto !important;
+            padding: var(--spacing-md) !important;
+        }
+
+        .translator-panel .translation {
+            max-width: 100% !important;
+            overflow: visible !important;
+            color: var(--panel-text) !important;
+            font-size: ${CONFIG.translationFontSize}px !important;
+            white-space: normal !important;
+            user-select: text !important;
+        }
+
         .translator-panel .error {
             padding: var(--spacing-xl) 0 !important;
-            text-align: center !important;
-            font-size: var(--font-sm) !important;
             color: var(--error) !important;
+            font-size: var(--font-sm) !important;
+            text-align: center !important;
         }
 
-        /* 发音按钮样式 */
-        .phonetic-buttons {
-            margin: 0 0 var(--spacing-sm) 0 !important;
+        /* 词典释义组件 */
+        .translator-panel .phonetic-buttons,
+        .translator-panel .sense-phonetic {
             display: flex !important;
-            gap: var(--spacing-xl) !important;
             flex-wrap: wrap !important;
-            padding: 0 !important;
         }
 
-        .audio-button {
-            border: none;
-            background: none;
-            cursor: pointer;
-            padding: var(--spacing-xs) var(--spacing-sm);
-            font-size: var(--font-xl);
-            color: var(--active-link);
-            transition: all 0.3s;
-            border-radius: var(--spacing-xs);
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
+        .translator-panel .phonetic-buttons {
+            gap: var(--spacing-xl) !important;
+            margin-bottom: var(--spacing-sm) !important;
         }
 
-        .audio-button:hover {
-            background-color: var(--hover-bg);
+        .translator-panel .phonetic-item {
+            display: flex !important;
+            align-items: center !important;
+            gap: var(--spacing-xs) !important;
+            padding: var(--spacing-xs) var(--spacing-sm) !important;
+            color: var(--text-secondary) !important;
+            white-space: nowrap !important;
+            user-select: text !important;
         }
 
-        .audio-button:active {
-            transform: scale(0.95);
+        .translator-panel .audio-button {
+            display: inline-flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            padding: var(--spacing-xs) var(--spacing-sm) !important;
+            border: 0 !important;
+            border-radius: var(--spacing-xs) !important;
+            background: transparent !important;
+            color: var(--active-link) !important;
+            font-size: var(--font-xl) !important;
+            cursor: pointer !important;
+            transition: background-color 0.2s, transform 0.2s !important;
         }
 
-        /* 词性标签容器样式 */
+        .translator-panel .audio-button:hover {
+            background: var(--hover-bg) !important;
+        }
+
+        .translator-panel .audio-button:active {
+            transform: scale(0.95) !important;
+        }
+
+        .translator-panel .sense-block {
+            display: flex !important;
+            align-items: flex-start !important;
+            gap: var(--spacing-md) !important;
+            margin: var(--spacing-xs) 0 !important;
+            padding: var(--spacing-xs) 0 !important;
+            border-bottom: 1px solid var(--panel-border) !important;
+            transition: var(--theme-transition) !important;
+        }
+
+        .translator-panel .sense-block:first-child {
+            margin-top: 0 !important;
+        }
+
+        .translator-panel .sense-block:last-child {
+            margin-bottom: 0 !important;
+            border-bottom: 0 !important;
+        }
+
         .translator-panel .pos-tags {
             display: flex !important;
             flex-direction: column !important;
-            gap: var(--spacing-xs) !important; /* 减少词性标签之间的间距 */
-            min-width: 35px !important;
             flex-shrink: 0 !important;
             align-items: center !important;
+            min-width: 35px !important;
+            gap: var(--spacing-xs) !important;
         }
 
-        /* 词性标签样式 */
         .translator-panel .pos-tag {
-            font-weight: 500 !important;
-            color: #fff !important;
+            width: 100% !important;
             padding: var(--spacing-xs) var(--spacing-sm) !important;
             border-radius: var(--spacing-xs) !important;
-            font-size: var(--font-sm) !important;
-            text-align: center !important;
-            width: 100% !important;
-            margin-bottom: 0 !important;
             background: var(--pos-color, #6b7280) !important;
+            color: #fff !important;
+            font-size: var(--font-sm) !important;
+            font-weight: 500 !important;
+            text-align: center !important;
+            user-select: text !important;
         }
 
-        /* 词汇等级标识样式 */
+        .translator-panel .def-text {
+            color: var(--panel-text) !important;
+        }
+
+        .translator-panel .trans-line {
+            margin-top: var(--spacing-xs) !important;
+            color: var(--panel-text) !important;
+            font-weight: 500 !important;
+        }
+
+        .translator-panel .phrase-def {
+            margin-top: var(--spacing-xs) !important;
+            color: var(--text-secondary) !important;
+        }
+
         .translator-panel .level-tag {
-            font-size: var(--font-xs) !important;
+            min-width: 24px !important;
+            margin-top: var(--spacing-xs) !important;
             padding: var(--spacing-xs) var(--spacing-sm) !important;
             border-radius: 3px !important;
-            text-align: center !important;
-            min-width: 24px !important;
-            margin-top: 2px !important;
+            font-size: var(--font-xs) !important;
             font-weight: 500 !important;
             letter-spacing: 0.5px !important;
+            text-align: center !important;
         }
 
-        /* 调整词性标签和释义内容的布局 */
         .translator-panel .def-content {
             flex: 1 !important;
-            min-width: 0 !important; /* 确保flex子项可以收缩 */
-            word-wrap: break-word !important; /* 确保长单词换行 */
-            overflow-wrap: break-word !important; /* 现代浏览器的单词换行 */
-            overflow: visible !important; /* 确保内容不被截断 */
+            min-width: 0 !important;
+            overflow: visible !important;
         }
 
-        /* 动画效果 */
-        .translator-panel.show {
-            opacity: 1 !important;
-            transform: translateY(0) !important;
-        }
-
-        .translator-panel.active {
-            display: block !important;
-            opacity: 1 !important;
-            transform: translateY(0) !important;
-        }
-
-        /* 添加释义发音样式 */
         .translator-panel .sense-phonetic {
-            margin-bottom: var(--spacing-xs) !important; /* 减少下边距 */
+            gap: var(--spacing-md) !important;
+            margin-bottom: var(--spacing-xs) !important;
             opacity: 0.8 !important;
-            display: flex !important;
-            flex-wrap: wrap !important;
-            gap: var(--spacing-md) !important; /* 减少间距 */
         }
 
         .translator-panel .sense-phonetic .phonetic-item {
-            font-size: var(--font-sm) !important;
-            color: var(--text-secondary) !important;
             flex: 0 1 auto !important;
+            color: var(--text-secondary) !important;
+            font-size: var(--font-sm) !important;
         }
 
         .translator-panel .sense-phonetic .audio-button {
-            font-size: var(--font-lg) !important;
             padding: var(--spacing-xs) !important;
+            font-size: var(--font-lg) !important;
         }
 
-        /* 添加切换图标样式 */
-        .translator-panel .switch-icon {
-            width: 12px !important;
-            height: 12px !important;
-            margin-left: 4px !important;
-            transition: transform 0.2s !important;
-            display: inline-block !important;
-            vertical-align: middle !important;
-            transform: rotate(0deg) !important;
+        /* 滚动条 */
+        .translator-panel .dropdown-menu::-webkit-scrollbar {
+            width: 3px !important;
+            height: 3px !important;
         }
 
-        .translator-panel .switch-icon.open {
-            transform: rotate(180deg) !important;
+        .translator-panel .translation-container::-webkit-scrollbar {
+            width: 5px !important;
+            height: 5px !important;
+        }
+
+        .translator-panel .dropdown-menu::-webkit-scrollbar-thumb,
+        .translator-panel .translation-container::-webkit-scrollbar-thumb {
+            border-radius: 4px !important;
+            background: var(--text-tertiary) !important;
+        }
+
+        .translator-panel .dropdown-menu::-webkit-scrollbar-thumb:hover,
+        .translator-panel .translation-container::-webkit-scrollbar-thumb:hover {
+            background: var(--text-secondary) !important;
+        }
+
+        .translator-panel .dropdown-menu::-webkit-scrollbar-track {
+            background: transparent !important;
+        }
+
+        .translator-panel .translation-container::-webkit-scrollbar-track {
+            border-radius: 4px !important;
+            background: var(--hover-bg) !important;
         }
     `);
 
