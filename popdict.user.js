@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PopDict 词窗 - 划词翻译
 // @namespace    https://github.com/vlan20/popdict
-// @version      0.1.3
+// @version      0.1.4
 // @description  一款简洁轻量的网页划词翻译脚本，双击即译，支持有道词典、剑桥词典和谷歌翻译，适配Tampermonkey脚本管理器。
 // @author       vlan20
 // @license      MIT
@@ -40,9 +40,11 @@
         darkModeClass: 'translator-panel-dark',
         panelSpacing: 12, // 减小面板间距
         panelWidth: 300,
-        maxPanelHeight: 400,
+        maxPanelHeightRatio: 0.75, // 长内容最多占用视口高度的 75%
         titleBarHeight: 40, // 添加标题栏高度配置
-        animationDuration: 200, // 添加动画持续时间配置
+        animationDuration: 200, // 面板淡出时间
+        loadingDelay: 120, // 超过该时间才显示加载条
+        hoverHideDelay: 80, // 高亮悬浮窗关闭延迟
         cacheExpiration: 24 * 60 * 60 * 1000, // 缓存过期时间（24小时）
         maxCacheSize: 100, // 最大缓存条目数
     };
@@ -86,63 +88,76 @@
 
     // 新建窗口前移除未固定的旧窗口，固定窗口保留。
     function cleanupPanels() {
+        hideHoverPanel();
         document.querySelectorAll('.translator-panel:not(.pinned)').forEach(panel => panel.remove());
     }
 
-    // 添加音频播放功能
+    // 使用 GM 请求音频数据并交给 Web Audio 播放，避免网页 CSP 拦截外部媒体。
     const audio = {
-        element: null,
-        getElement() {
-            if (!this.element) {
-                this.element = document.createElement('audio');
-                this.element.style.display = 'none';
-                document.body.appendChild(this.element);
-            }
-            return this.element;
+        context: null,
+        source: null,
+        async getContext() {
+            const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+            if (!AudioContextClass) throw new Error('当前浏览器不支持 Web Audio');
+            if (!this.context) this.context = new AudioContextClass();
+            if (this.context.state !== 'running') await this.context.resume();
+            return this.context;
+        },
+        fetch(url) {
+            return new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url,
+                    anonymous: true,
+                    responseType: 'arraybuffer',
+                    onload: response => {
+                        if (response.status < 200 || response.status >= 300) {
+                            reject(new Error(`音频请求失败（HTTP ${response.status}）`));
+                            return;
+                        }
+                        const data = response.response;
+                        if (!(data instanceof ArrayBuffer)) {
+                            reject(new Error('音频响应格式不正确'));
+                            return;
+                        }
+                        resolve(data);
+                    },
+                    onerror: () => reject(new Error('音频请求失败'))
+                });
+            });
         },
         async play(url) {
             try {
-                const audioElement = this.getElement();
-                audioElement.src = url;
-                await audioElement.play();
+                const context = await this.getContext();
+                const data = await this.fetch(url);
+                const buffer = await context.decodeAudioData(data.slice(0));
+
+                if (this.source) {
+                    try { this.source.stop(); } catch (_) {}
+                }
+
+                const source = context.createBufferSource();
+                source.buffer = buffer;
+                source.connect(context.destination);
+                source.onended = () => {
+                    if (this.source === source) this.source = null;
+                };
+                this.source = source;
+                source.start();
             } catch (error) {
                 console.error('播放音频失败:', error);
             }
         }
     };
 
-    // 封装 GM_xmlhttpRequest 为 Promise，并统一处理超时与 HTTP 错误。
-    // 不再伪装固定的旧版 Chrome UA，让脚本管理器使用浏览器当前的真实 UA。
-    const gmGet = (url, headers = {}, options = {}) => new Promise((resolve, reject) => {
+    // 统一 GET 请求；不伪造 User-Agent，剑桥单独使用匿名请求避开异常 Cookie 状态。
+    const gmGet = (url, options = {}) => new Promise((resolve, reject) => {
         GM_xmlhttpRequest({
             method: 'GET',
             url,
-            headers,
-            timeout: 15000,
-            anonymous: false,
             ...options,
-            onload(response) {
-                const status = Number(response.status) || 0;
-                if ((status >= 200 && status < 300) || (status === 0 && response.responseText)) {
-                    resolve(response);
-                    return;
-                }
-
-                const error = new Error(`HTTP ${status || '未知状态'}`);
-                error.status = status;
-                error.finalUrl = response.finalUrl || url;
-                error.responseText = response.responseText || '';
-                reject(error);
-            },
-            onerror(response) {
-                const error = new Error('网络请求失败');
-                error.status = Number(response?.status) || 0;
-                error.finalUrl = response?.finalUrl || url;
-                reject(error);
-            },
-            ontimeout() {
-                reject(new Error('请求超时'));
-            }
+            onload: resolve,
+            onerror: reject
         });
     });
 
@@ -154,7 +169,7 @@
             if (cachedResult) return cachedResult;
 
             const result = await translateFn(text);
-            if (!result) throw new Error(`${name}翻译失败: 翻译结果为空`);
+            if (!result?.html) throw new Error(`${name}翻译失败: 翻译结果为空`);
 
             translationCache.set(text, name, result);
             return result;
@@ -168,7 +183,7 @@
                 const response = await gmGet(`https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-CN&dt=t&q=${encodeURIComponent(text)}`);
                 const result = JSON.parse(response.responseText);
                 if (!result?.[0]?.length) throw new Error('谷歌翻译返回的数据格式不正确');
-                return result[0].map(x => x[0]).join('');
+                return { html: result[0].map(x => x[0]).join(''), highlightable: false };
             } catch (error) {
                 console.error('谷歌翻译错误:', error);
                 throw new Error('谷歌翻译失败: ' + error.message);
@@ -179,7 +194,7 @@
             try {
                 const response = await gmGet(
                     `https://dict.youdao.com/jsonapi?xmlVersion=5.1&jsonversion=2&q=${encodeURIComponent(text)}`,
-                    { 'Referer': 'https://dict.youdao.com' }
+                    { headers: { 'Referer': 'https://dict.youdao.com' } }
                 );
 
                 const result = JSON.parse(response.responseText);
@@ -193,27 +208,27 @@
 
                 // 添加音标和发音按钮
                 if (wordInfo?.ukphone || wordInfo?.usphone) {
-                        translation += '<div class="phonetic-buttons">';
+                    translation += '<div class="phonetic-buttons">';
                     if (wordInfo.ukphone && audioUrls.uk) translation += createPronHtml('英', wordInfo.ukphone, audioUrls.uk);
                     if (wordInfo.usphone && audioUrls.us) translation += createPronHtml('美', wordInfo.usphone, audioUrls.us);
-                        translation += '</div>\n\n';
+                    translation += '</div>\n\n';
                 }
 
-            // 获取翻译结果
+                // 获取翻译结果
                 if (wordInfo?.trs) {
                     translation += wordInfo.trs.map(tr => tr.tr[0].l.i.join('; ')).join('\n');
-            } else if (result.fanyi) {
+                } else if (result.fanyi) {
                     translation = result.fanyi.tran;
-            } else if (result.translation) {
+                } else if (result.translation) {
                     translation = result.translation.join('\n');
-            } else if (result.web_trans?.web_translation) {
+                } else if (result.web_trans?.web_translation) {
                     translation = result.web_trans.web_translation
                         .map(item => item.trans.map(t => t.value).join('; '))
                         .join('\n');
                 }
 
-            if (!translation) throw new Error('未找到翻译结果');
-                return translation;
+                if (!translation) throw new Error('未找到翻译结果');
+                return { html: translation, highlightable: Boolean(wordInfo?.trs) };
             } catch (error) {
                 console.error('有道词典错误:', error);
                 throw new Error('有道词典失败: ' + error.message);
@@ -222,19 +237,16 @@
 
         cambridge: createTranslator('剑桥词典', async (text) => {
             try {
-                const response = await new Promise((resolve, reject) => {
-                    GM_xmlhttpRequest({
-                        method: 'GET',
-                        url: `https://dictionary.cambridge.org/search/english-chinese-simplified/direct/?q=${encodeURIComponent(text)}`,
+                const response = await gmGet(
+                    `https://dictionary.cambridge.org/search/english-chinese-simplified/direct/?q=${encodeURIComponent(text)}`,
+                    {
+                        anonymous: true,
                         headers: {
-                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                            'Accept-Language': 'en-US,en;q=0.5',
-                        },
-                        onload: resolve,
-                        onerror: reject,
-                    });
-                });
+                            'Accept-Language': 'en-US,en;q=0.5'
+                        }
+                    }
+                );
 
                 const parser = new DOMParser();
                 const doc = parser.parseFromString(response.responseText, 'text/html');
@@ -343,12 +355,18 @@
                     throw new Error('未找到释义');
                 }
 
-                return translation;
+                return { html: translation, highlightable: true };
             } catch (error) {
                 console.error('剑桥词典错误:', error);
                 throw new Error('剑桥词典失败: ' + error.message);
             }
         })
+    };
+
+    const EXTERNAL_URLS = {
+        google: 'https://translate.google.com/?sl=auto&tl=zh-CN&text=',
+        youdao: 'https://dict.youdao.com/w/',
+        cambridge: 'https://dictionary.cambridge.org/dictionary/english-chinese-simplified/'
     };
 
     // 添加样式
@@ -362,10 +380,13 @@
             --title-bg: #f8fafc;
             --title-text: #334155;
             --title-border: #e2e8f0;
-            --switch-hover-bg: #e2e8f0;
             --text-secondary: #475569;
             --text-tertiary: #64748b;
             --hover-bg: #f1f5f9;
+            --title-hover-bg: #e2e8f0;
+            --highlight-bg: rgba(245, 158, 11, 0.22);
+            --highlight-hover-bg: rgba(245, 158, 11, 0.38);
+            --highlight-line: rgba(217, 119, 6, 0.7);
             --active-link: #3b82f6;
             --error: #ef4444;
             --spacing-xs: 2px;
@@ -384,8 +405,10 @@
             position: absolute !important;
             z-index: 2147483647 !important;
             display: none;
+            flex-direction: column !important;
+            box-sizing: border-box !important;
             max-width: ${CONFIG.panelWidth}px !important;
-            max-height: 80vh !important;
+            max-height: calc(100vh - ${CONFIG.panelSpacing * 2}px) !important;
             overflow: hidden !important;
             padding: var(--spacing-md) !important;
             border: 1px solid var(--panel-border) !important;
@@ -408,10 +431,10 @@
             --title-bg: #2c2c2c;
             --title-text: #e0e0e0;
             --title-border: #333;
-            --switch-hover-bg: rgba(255, 255, 255, 0.16);
             --text-secondary: #999;
             --text-tertiary: #888;
             --hover-bg: rgba(255, 255, 255, 0.1);
+            --title-hover-bg: rgba(255, 255, 255, 0.16);
             --active-link: #4a9eff;
             --error: #ff7875;
         }
@@ -457,25 +480,17 @@
             border-bottom: 1px solid var(--title-border) !important;
             border-radius: 6px 6px 0 0 !important;
             background: var(--title-bg) !important;
+            flex: 0 0 auto !important;
             cursor: move !important;
             user-select: none !important;
             transition: var(--theme-transition) !important;
         }
 
-        .translator-panel .title-wrapper,
-        .translator-panel .theme-button,
-        .translator-panel .pin-button,
-        .translator-panel .clear-button,
-        .translator-panel .external-button {
-            display: flex !important;
-            align-items: center !important;
-            cursor: pointer !important;
-            transition: background-color 0.2s, opacity 0.2s !important;
-        }
 
         .translator-panel .title-wrapper {
             position: relative !important;
             display: inline-flex !important;
+            align-items: center !important;
             flex: 0 0 auto !important;
             width: max-content !important;
             gap: var(--spacing-sm) !important;
@@ -484,11 +499,13 @@
             border: 0 !important;
             border-radius: var(--spacing-sm) !important;
             background: transparent !important;
+            cursor: pointer !important;
+            transition: background-color 0.2s !important;
         }
 
         .translator-panel .title-wrapper:hover,
-        .translator-panel.dropdown-open .title-wrapper {
-            background: var(--switch-hover-bg) !important;
+        .translator-panel .title-wrapper.open {
+            background: var(--title-hover-bg) !important;
         }
 
         .translator-panel .title,
@@ -511,11 +528,14 @@
 
         .translator-panel .switch-icon {
             flex: 0 0 auto !important;
-            width: 12px !important;
-            height: 12px !important;
-            margin-left: var(--spacing-sm) !important;
+            width: 8px !important;
+            height: 5px !important;
+            margin-left: 2px !important;
+            background: var(--text-tertiary) !important;
+            clip-path: polygon(0 0, 100% 0, 50% 100%) !important;
             transform: rotate(0deg) !important;
-            transition: transform 0.2s !important;
+            transform-origin: center !important;
+            transition: transform 0.2s ease !important;
         }
 
         .translator-panel .switch-icon.open {
@@ -526,58 +546,185 @@
         .translator-panel .theme-button,
         .translator-panel .pin-button,
         .translator-panel .clear-button,
-        .translator-panel .external-button {
-            flex: 0 0 var(--font-xl) !important;
+        .translator-panel .external-button,
+        .translator-panel .unhighlight-button {
+            display: flex !important;
+            align-items: center !important;
             justify-content: center !important;
+            flex: 0 0 var(--font-xl) !important;
             width: var(--font-xl) !important;
             height: var(--font-xl) !important;
+            border: 0 !important;
+            background: transparent !important;
             color: var(--title-text) !important;
-            font-size: var(--font-lg) !important;
+            cursor: pointer !important;
             opacity: 0.62 !important;
+            transition: opacity 0.2s !important;
         }
 
         .translator-panel .theme-button:hover,
         .translator-panel .pin-button:hover,
         .translator-panel .clear-button:hover,
-        .translator-panel .external-button:hover {
+        .translator-panel .external-button:hover,
+        .translator-panel .unhighlight-button:hover {
             opacity: 1 !important;
         }
 
+        .translator-panel .unhighlight-button[hidden] {
+            display: none !important;
+        }
+
+        .translator-panel .theme-button,
+        .translator-panel .pin-button,
+        .translator-panel .clear-button,
+        .translator-panel .external-button,
+        .translator-panel .unhighlight-button {
+            position: relative !important;
+        }
+
+        .translator-panel .theme-button::before,
         .translator-panel .theme-button::after,
+        .translator-panel .pin-button::before,
         .translator-panel .pin-button::after,
+        .translator-panel .clear-button::before,
         .translator-panel .clear-button::after,
-        .translator-panel .external-button::after {
+        .translator-panel .external-button::before,
+        .translator-panel .external-button::after,
+        .translator-panel .unhighlight-button::before,
+        .translator-panel .unhighlight-button::after {
             content: "" !important;
+            position: absolute !important;
             display: block !important;
-            width: 16px !important;
-            height: 16px !important;
+            box-sizing: border-box !important;
+            pointer-events: none !important;
+        }
+
+        /* 固定：圆形图钉，固定后填充 */
+        .translator-panel .pin-button::before {
+            top: 1px !important;
+            left: 4px !important;
+            width: 8px !important;
+            height: 8px !important;
+            border: 1.5px solid currentColor !important;
+            border-radius: 50% !important;
+        }
+
+        .translator-panel .pin-button::after {
+            top: 8px !important;
+            left: 7px !important;
+            width: 2px !important;
+            height: 8px !important;
+            border-radius: 1px !important;
             background: currentColor !important;
-            -webkit-mask: var(--icon) center / contain no-repeat !important;
-            mask: var(--icon) center / contain no-repeat !important;
         }
 
-        .translator-panel .pin-button.unpinned {
-            --icon: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="7" r="4"/><path d="M12 12v9"/></svg>');
+        .translator-panel .pin-button.pinned::before {
+            background: currentColor !important;
         }
 
-        .translator-panel .pin-button.pinned {
-            --icon: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="7" r="4" fill="black"/><path d="M12 12v9"/></svg>');
+        /* 主题：亮色状态显示月亮，暗色状态显示太阳 */
+        .translator-panel .theme-button.light::before {
+            top: 1px !important;
+            left: 1px !important;
+            width: 14px !important;
+            height: 14px !important;
+            border: 1.5px solid currentColor !important;
+            border-radius: 50% !important;
         }
 
-        .translator-panel .theme-button.light {
-            --icon: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>');
+        .translator-panel .theme-button.light::after {
+            top: -1px !important;
+            left: 6px !important;
+            width: 11px !important;
+            height: 11px !important;
+            border-radius: 50% !important;
+            background: var(--title-bg) !important;
         }
 
-        .translator-panel .theme-button.dark {
-            --icon: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>');
+        .translator-panel .theme-button.dark::before {
+            top: 4px !important;
+            left: 4px !important;
+            width: 8px !important;
+            height: 8px !important;
+            border: 1.5px solid currentColor !important;
+            border-radius: 50% !important;
         }
 
-        .translator-panel .clear-button {
-            --icon: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round"><path d="M3 3l18 18M3 21L21 3"/></svg>');
+        .translator-panel .theme-button.dark::after {
+            top: 0 !important;
+            left: 7px !important;
+            width: 2px !important;
+            height: 2px !important;
+            border-radius: 1px !important;
+            background: currentColor !important;
+            box-shadow:
+                0 14px 0 currentColor,
+                -7px 7px 0 currentColor,
+                7px 7px 0 currentColor,
+                -5px 2px 0 currentColor,
+                5px 2px 0 currentColor,
+                -5px 12px 0 currentColor,
+                5px 12px 0 currentColor !important;
         }
 
-        .translator-panel .external-button {
-            --icon: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6M10 14L21 3"/></svg>');
+        /* 关闭：两条交叉线 */
+        .translator-panel .clear-button::before,
+        .translator-panel .clear-button::after {
+            top: 7px !important;
+            left: 1px !important;
+            width: 14px !important;
+            height: 2px !important;
+            border-radius: 1px !important;
+            background: currentColor !important;
+        }
+
+        .translator-panel .clear-button::before {
+            transform: rotate(45deg) !important;
+        }
+
+        .translator-panel .clear-button::after {
+            transform: rotate(-45deg) !important;
+        }
+
+        /* 外部打开：方框与右上箭头 */
+        .translator-panel .external-button::before {
+            left: 1px !important;
+            bottom: 1px !important;
+            width: 11px !important;
+            height: 11px !important;
+            border: 1.5px solid currentColor !important;
+            border-radius: 2px !important;
+        }
+
+        .translator-panel .external-button::after {
+            top: 0 !important;
+            right: 0 !important;
+            width: 9px !important;
+            height: 9px !important;
+            border-top: 1.5px solid currentColor !important;
+            border-right: 1.5px solid currentColor !important;
+            background: linear-gradient(135deg,
+                transparent 43%, currentColor 44%, currentColor 56%, transparent 57%) !important;
+        }
+
+        /* 取消高亮：倾斜橡皮擦 */
+        .translator-panel .unhighlight-button::before {
+            top: 3px !important;
+            left: 2px !important;
+            width: 12px !important;
+            height: 8px !important;
+            border: 1.5px solid currentColor !important;
+            border-radius: 2px !important;
+            transform: rotate(-45deg) !important;
+        }
+
+        .translator-panel .unhighlight-button::after {
+            top: 12px !important;
+            left: 2px !important;
+            width: 12px !important;
+            height: 1.5px !important;
+            border-radius: 1px !important;
+            background: currentColor !important;
         }
 
         /* 翻译器下拉菜单 */
@@ -687,20 +834,62 @@
             display: none !important;
         }
 
+        /* 加载状态与网页高亮 */
+        .translator-panel .loading-bar {
+            position: absolute !important;
+            top: 27px !important;
+            left: 0 !important;
+            right: 0 !important;
+            height: 2px !important;
+            overflow: hidden !important;
+            opacity: 0 !important;
+            pointer-events: none !important;
+        }
+
+        .translator-panel.loading .loading-bar {
+            opacity: 1 !important;
+        }
+
+        .translator-panel .loading-bar::after {
+            content: '' !important;
+            display: block !important;
+            width: 38% !important;
+            height: 100% !important;
+            background: var(--active-link) !important;
+            animation: popdict-loading 0.9s ease-in-out infinite !important;
+        }
+
+        @keyframes popdict-loading {
+            from { transform: translateX(-110%); }
+            to { transform: translateX(290%); }
+        }
+
+        .popdict-highlight {
+            background: var(--highlight-bg, rgba(245, 158, 11, 0.22)) !important;
+            box-shadow: inset 0 -2px var(--highlight-line, rgba(217, 119, 6, 0.7)) !important;
+            border-radius: 2px !important;
+            cursor: help !important;
+        }
+
+        .popdict-highlight:hover {
+            background: var(--highlight-hover-bg, rgba(245, 158, 11, 0.38)) !important;
+        }
+
         /* 翻译内容 */
         .translator-panel .content {
             position: relative !important;
             display: flex !important;
+            flex: 1 1 auto !important;
             flex-direction: column !important;
+            min-height: 0 !important;
             height: auto !important;
-            max-height: calc(80vh - ${CONFIG.titleBarHeight}px) !important;
-            overflow: visible !important;
+            max-height: none !important;
+            overflow: hidden !important;
         }
 
         .translator-panel .source-text-container {
-            position: sticky !important;
-            top: 0 !important;
-            z-index: 1 !important;
+            flex: 0 0 auto !important;
+            overflow: visible !important;
             margin: calc(-1 * var(--spacing-md)) calc(-1 * var(--spacing-md)) 0 !important;
             padding: var(--spacing-md) var(--spacing-lg) var(--spacing-md) calc(var(--spacing-lg) + var(--spacing-sm)) !important;
             border-bottom: 1px solid var(--panel-border) !important;
@@ -728,8 +917,9 @@
 
         .translator-panel .translation-container {
             display: block !important;
-            flex: 1 !important;
-            max-height: calc(80vh - ${CONFIG.titleBarHeight}px - 100px) !important;
+            flex: 1 1 auto !important;
+            min-height: 0 !important;
+            max-height: none !important;
             overflow-y: auto !important;
             padding: var(--spacing-md) !important;
         }
@@ -834,21 +1024,6 @@
             user-select: text !important;
         }
 
-        .translator-panel .def-text {
-            color: var(--panel-text) !important;
-        }
-
-        .translator-panel .trans-line {
-            margin-top: var(--spacing-xs) !important;
-            color: var(--panel-text) !important;
-            font-weight: 500 !important;
-        }
-
-        .translator-panel .phrase-def {
-            margin-top: var(--spacing-xs) !important;
-            color: var(--text-secondary) !important;
-        }
-
         .translator-panel .level-tag {
             min-width: 24px !important;
             margin-top: var(--spacing-xs) !important;
@@ -926,6 +1101,9 @@
     };
 
     let dragState = null;
+    let hoverPanel = null;
+    let hoverHideTimer = null;
+    const highlightStore = new WeakMap();
 
     const utils = {
         escapeMap: {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'},
@@ -952,41 +1130,74 @@
         },
         setError(message, targetPanel) {
             const content = targetPanel?.querySelector('.content');
-            if (content) content.innerHTML = `<div class="error">${utils.escapeHtml(message)}</div>`;
+            if (!content) return;
+            content.innerHTML = `<div class="error">${utils.escapeHtml(message)}</div>`;
+            requestAnimationFrame(() => utils.fitPanelToViewport(targetPanel));
         },
-        showPanel(x, y, targetPanel) {
+        fitPanelToViewport(targetPanel) {
+            if (!targetPanel?.isConnected || targetPanel.style.display === 'none') return;
+
             const {innerWidth: vw, innerHeight: vh, scrollX: sx, scrollY: sy} = window;
             const spacing = CONFIG.panelSpacing;
-            const maxHeight = Math.max(
-                CONFIG.titleBarHeight + spacing,
-                Math.min(CONFIG.maxPanelHeight, vh - spacing * 2)
+            const viewportMaxHeight = Math.max(
+                CONFIG.titleBarHeight,
+                Math.min(Math.floor(vh * CONFIG.maxPanelHeightRatio), vh - spacing * 2)
             );
+            const minHeight = Math.min(CONFIG.titleBarHeight + 48, viewportMaxHeight);
 
+            targetPanel.style.display = 'flex';
+            targetPanel.style.setProperty('max-height', `${viewportMaxHeight}px`, 'important');
+
+            // 拖动后的窗口只约束在视口内，不再跳回最初选中文字的位置。
+            if (targetPanel.manualPosition) {
+                const rect = targetPanel.getBoundingClientRect();
+                const panelWidth = Math.min(targetPanel.offsetWidth || CONFIG.panelWidth, vw - spacing * 2);
+                const panelHeight = Math.min(targetPanel.offsetHeight || minHeight, viewportMaxHeight);
+                const left = Math.min(Math.max(rect.left, spacing), Math.max(spacing, vw - panelWidth - spacing));
+                const top = Math.min(Math.max(rect.top, spacing), Math.max(spacing, vh - panelHeight - spacing));
+                targetPanel.style.left = `${left + sx}px`;
+                targetPanel.style.top = `${top + sy}px`;
+                return;
+            }
+
+            const anchor = targetPanel.anchorPoint;
+            if (!anchor) return;
+
+            const anchorX = anchor.x - sx;
+            const anchorY = anchor.y - sy;
+            const measuredHeight = Math.min(
+                Math.max(targetPanel.offsetHeight || minHeight, minHeight),
+                viewportMaxHeight
+            );
+            const spaceBelow = Math.max(0, vh - anchorY - spacing);
+            const spaceAbove = Math.max(0, anchorY - spacing);
+            const placeBelow = spaceBelow >= measuredHeight || spaceBelow >= spaceAbove;
+            const availableHeight = placeBelow ? spaceBelow : spaceAbove;
+            const maxHeight = Math.max(minHeight, Math.min(viewportMaxHeight, availableHeight));
+
+            targetPanel.style.setProperty('max-height', `${maxHeight}px`, 'important');
+
+            const panelWidth = Math.min(targetPanel.offsetWidth || CONFIG.panelWidth, vw - spacing * 2);
+            const panelHeight = Math.min(targetPanel.offsetHeight || minHeight, maxHeight);
+            const left = Math.min(Math.max(anchorX, spacing), Math.max(spacing, vw - panelWidth - spacing));
+            const rawTop = placeBelow
+                ? anchorY + spacing
+                : anchorY - panelHeight - spacing;
+            const top = Math.min(Math.max(rawTop, spacing), Math.max(spacing, vh - panelHeight - spacing));
+
+            targetPanel.style.left = `${left + sx}px`;
+            targetPanel.style.top = `${top + sy}px`;
+        },
+        showPanel(x, y, targetPanel) {
+            targetPanel.anchorPoint = {x, y};
+            targetPanel.manualPosition = false;
             Object.assign(targetPanel.style, {
-                position: 'absolute',
                 left: '-9999px',
                 top: '-9999px',
-                display: 'block',
-                maxHeight: `${maxHeight}px`
+                display: 'flex'
             });
 
-            // 内容尚未返回时至少按一个小窗口估算位置；结果返回后高度可自然增长。
-            const estimatedHeight = Math.min(Math.max(targetPanel.offsetHeight, 120), maxHeight);
-            const panelX = Math.max(spacing + sx, Math.min(sx + vw - CONFIG.panelWidth - spacing, x));
-            const spaceBelow = vh - (y - sy);
-            const spaceAbove = y - sy;
-            const panelY = spaceBelow >= estimatedHeight || spaceBelow >= spaceAbove
-                ? y + spacing
-                : y - estimatedHeight - spacing;
-
-            Object.assign(targetPanel.style, {
-                left: `${panelX}px`,
-                top: `${Math.max(sy + spacing, panelY)}px`
-            });
-
-            const content = targetPanel.querySelector('.content');
-            if (content) content.style.maxHeight = `${maxHeight - CONFIG.titleBarHeight - spacing}px`;
-
+            this.fitPanelToViewport(targetPanel);
             targetPanel.classList.toggle(CONFIG.darkModeClass, this.isDarkMode());
             requestAnimationFrame(() => targetPanel.classList.add('show'));
         },
@@ -994,7 +1205,9 @@
             if (!targetPanel || targetPanel.classList.contains('pinned')) return;
             targetPanel.classList.remove('show');
             setTimeout(() => {
-                if (!targetPanel.classList.contains('show')) targetPanel.remove();
+                if (targetPanel.classList.contains('show')) return;
+                if (targetPanel === hoverPanel) hoverPanel = null;
+                targetPanel.remove();
             }, CONFIG.animationDuration);
         },
         isTranslatable(text) {
@@ -1006,12 +1219,190 @@
             if (hasChinese && !hasOtherLanguage) return false;
             return !/^[\d\s\p{P}\p{S}]+$/u.test(compact);
         },
+        isEditableTarget: target => target instanceof Element && Boolean(
+            target.closest('input, textarea, select, option, [contenteditable]:not([contenteditable="false"])')
+        ),
         isClickInPanel: e => e.target instanceof Element && Boolean(e.target.closest('.translator-panel')),
         preventSelectionTrigger() {
             state.ignoreNextSelection = true;
             setTimeout(() => { state.ignoreNextSelection = false; }, 100);
         }
     };
+
+    const buildContentHTML = (text, html) => `
+        <div class="source-text-container">
+            <div class="source-text"><strong>${utils.escapeHtml(text).replace(/\n/g, '<br>')}</strong></div>
+        </div>
+        <div class="translation-container"><div class="translation">${html}</div></div>`;
+
+    function getTextOffset(container, node, offset) {
+        const range = document.createRange();
+        range.selectNodeContents(container);
+        range.setEnd(node, offset);
+        return range.toString().length;
+    }
+
+    function captureSelectionBookmark(range) {
+        let container = range.commonAncestorContainer;
+        if (container.nodeType === Node.TEXT_NODE) container = container.parentElement;
+        while (container?.classList?.contains('popdict-highlight')) container = container.parentElement;
+        if (!container || container.closest?.('.translator-panel')) return null;
+
+        try {
+            const start = getTextOffset(container, range.startContainer, range.startOffset);
+            return { container, start, end: start + range.toString().length, text: range.toString() };
+        } catch {
+            return null;
+        }
+    }
+
+    // 词典只接收单词或短语；谷歌保留完整选区。所有判断均在请求前完成。
+    function prepareSelection(text, translatorKey) {
+        const leading = text.length - text.trimStart().length;
+        const trimmed = text.trim();
+        if (!trimmed) return null;
+
+        if (translatorKey === 'google') {
+            return { text: trimmed, start: leading, end: leading + trimmed.length };
+        }
+
+        const token = String.raw`[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*`;
+        const phrasePattern = new RegExp(`${token}(?:\\s+${token})*`, 'g');
+        const matches = Array.from(trimmed.matchAll(phrasePattern))
+            .filter(match => /[A-Za-z]/.test(match[0]));
+
+        // 中英文混选时仅接受唯一的英文片段；多个片段直接静默忽略。
+        const hasNonPhraseText = /[^A-Za-z0-9'’\s-]/.test(trimmed);
+        let candidate = trimmed;
+        let relativeStart = 0;
+        if (hasNonPhraseText) {
+            if (matches.length !== 1) return null;
+            candidate = matches[0][0];
+            relativeStart = matches[0].index;
+        }
+
+        const words = candidate.match(/[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*/g) || [];
+        const isDictionaryPhrase = words.length >= 1
+            && words.length <= 6
+            && candidate.length <= 60
+            && new RegExp(`^${token}(?:\\s+${token})*$`).test(candidate);
+
+        if (!isDictionaryPhrase) return null;
+
+        const start = leading + relativeStart;
+        return { text: candidate, start, end: start + candidate.length };
+    }
+
+    function rangeFromBookmark({container, start, end}) {
+        if (!container?.isConnected || end <= start) return null;
+        const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+        const range = document.createRange();
+        let node, offset = 0, started = false;
+
+        while ((node = walker.nextNode())) {
+            const next = offset + node.data.length;
+            if (!started && start <= next) {
+                range.setStart(node, Math.max(0, start - offset));
+                started = true;
+            }
+            if (started && end <= next) {
+                range.setEnd(node, Math.max(0, end - offset));
+                return range;
+            }
+            offset = next;
+        }
+        return null;
+    }
+
+    function setHighlightButton(panel, visible) {
+        const button = panel?.querySelector('.unhighlight-button');
+        if (button) button.hidden = !visible;
+    }
+
+    function removeHighlight(span) {
+        if (!span?.isConnected) return;
+        const data = highlightStore.get(span);
+        if (data?.ownerPanel?.highlightElement === span) {
+            data.ownerPanel.highlightElement = null;
+            setHighlightButton(data.ownerPanel, false);
+        }
+        if (hoverPanel?.highlightElement === span) hideHoverPanel();
+
+        const parent = span.parentNode;
+        span.replaceWith(...span.childNodes);
+        parent?.normalize();
+    }
+
+    function applyHighlight(bookmark, result, targetPanel) {
+        const {container, start, end, text} = bookmark || {};
+        if (!container?.isConnected || !text || end <= start) return null;
+
+        // 只有新查询成功后才移除重叠高亮，因此失败不会破坏旧标记。
+        container.querySelectorAll('.popdict-highlight').forEach(span => {
+            const spanStart = getTextOffset(container, span, 0);
+            const spanEnd = spanStart + span.textContent.length;
+            if (spanStart < end && spanEnd > start) removeHighlight(span);
+        });
+
+        const range = rangeFromBookmark(bookmark);
+        if (!range || range.collapsed) return null;
+
+        const span = document.createElement('span');
+        span.className = 'popdict-highlight';
+        span.appendChild(range.extractContents());
+        range.insertNode(span);
+
+        highlightStore.set(span, {
+            text,
+            html: result.html,
+            translatorKey: targetPanel.translatorKey,
+            ownerPanel: targetPanel
+        });
+        targetPanel.highlightElement = span;
+        setHighlightButton(targetPanel, true);
+        return span;
+    }
+
+    function hideHoverPanel(force = false) {
+        clearTimeout(hoverHideTimer);
+        hoverHideTimer = null;
+        if (!hoverPanel) return;
+        if (!force && hoverPanel.classList.contains('pinned')) return;
+        hoverPanel.remove();
+        hoverPanel = null;
+    }
+
+    function scheduleHideHover() {
+        clearTimeout(hoverHideTimer);
+        hoverHideTimer = setTimeout(hideHoverPanel, CONFIG.hoverHideDelay);
+    }
+
+    function showHoverPanel(span) {
+        const data = highlightStore.get(span);
+        // 当前查询窗口仍存在时，同一处高亮不再额外弹出悬浮窗。
+        if (!data || data.ownerPanel?.isConnected) return;
+        if (hoverPanel && !hoverPanel.isConnected) hoverPanel = null;
+        if (hoverPanel?.highlightElement === span) return;
+
+        hideHoverPanel();
+        const panel = createTranslatorPanel({
+            translatorKey: data.translatorKey,
+            translationText: data.text,
+            highlightElement: span,
+            resultHtml: data.html
+        });
+        document.body.appendChild(panel);
+        highlightStore.set(span, {...data, ownerPanel: panel});
+
+        panel.addEventListener('mouseenter', () => clearTimeout(hoverHideTimer));
+        panel.addEventListener('mouseleave', e => {
+            if (!panel.classList.contains('pinned') && e.relatedTarget !== span) scheduleHideHover();
+        });
+        hoverPanel = panel;
+
+        const rect = span.getBoundingClientRect();
+        utils.showPanel(rect.left + window.scrollX, rect.bottom + window.scrollY, panel);
+    }
 
     function resetPanelSelection() {
         state.isSelectingInPanel = false;
@@ -1029,32 +1420,44 @@
         if (!translator) throw new Error('未找到指定的翻译器');
 
         targetPanel.translationText = textToTranslate;
-        const formattedTranslation = await translator.translate(textToTranslate);
-        if (!formattedTranslation) throw new Error('翻译结果为空');
+        const requestId = ++targetPanel.requestId;
+        const loadingTimer = setTimeout(() => {
+            if (requestId === targetPanel.requestId) targetPanel.classList.add('loading');
+        }, CONFIG.loadingDelay);
 
-        const content = targetPanel.querySelector('.content');
-        if (!content) throw new Error('未找到内容容器元素');
+        try {
+            const result = await translator.translate(textToTranslate);
+            if (requestId !== targetPanel.requestId) return null;
 
-        content.innerHTML = `
-            <div class="source-text-container">
-                <div class="source-text"><strong>${utils.escapeHtml(textToTranslate).replace(/\n/g, '<br>')}</strong></div>
-            </div>
-            <div class="translation-container">
-                <div class="translation">${formattedTranslation}</div>
-            </div>`;
+            const content = targetPanel.querySelector('.content');
+            if (!content) throw new Error('未找到内容容器元素');
+            content.innerHTML = buildContentHTML(textToTranslate, result.html);
+            requestAnimationFrame(() => utils.fitPanelToViewport(targetPanel));
 
-        targetPanel.querySelectorAll('.audio-button').forEach(button => {
-            button.addEventListener('click', async e => {
-                e.preventDefault();
-                e.stopPropagation();
-                utils.preventSelectionTrigger();
-                state.isSelectingInPanel = false;
-                const url = button.dataset.url;
-                if (url) await audio.play(url);
-            });
-        });
+            if (targetPanel.highlightElement && !targetPanel.highlightElement.isConnected) {
+                targetPanel.highlightElement = null;
+                setHighlightButton(targetPanel, false);
+            }
 
-        targetPanel.classList.add('show');
+            if (result.highlightable) {
+                if (targetPanel.highlightElement?.isConnected) {
+                    highlightStore.set(targetPanel.highlightElement, {
+                        text: textToTranslate,
+                        html: result.html,
+                        translatorKey: targetPanel.translatorKey,
+                        ownerPanel: targetPanel
+                    });
+                    setHighlightButton(targetPanel, true);
+                } else if (targetPanel.selectionBookmark) {
+                    applyHighlight(targetPanel.selectionBookmark, result, targetPanel);
+                }
+            }
+
+            return result;
+        } finally {
+            clearTimeout(loadingTimer);
+            if (requestId === targetPanel.requestId) targetPanel.classList.remove('loading');
+        }
     }
 
     function buildPanelHTML(translatorKey) {
@@ -1062,46 +1465,81 @@
                 <div class="title-wrapper">
                     <span class="title">${TRANSLATORS[translatorKey].name}</span>
                     <span class="switch-text">（点击切换）</span>
-                    <svg class="switch-icon" viewBox="0 0 1024 1024"><path fill="currentColor" d="M884 256h-75c-5.1 0-9.9 2.5-12.9 6.6L512 654.2 227.9 262.6c-3-4.1-7.8-6.6-12.9-6.6h-75c-6.5 0-10.3 7.4-6.5 12.7l352.6 486.1c12.8 17.6 39 17.6 51.7 0l352.6-486.1c3.9-5.3.1-12.7-6.4-12.7z"/></svg>
+                    <span class="switch-icon" aria-hidden="true"></span>
                     <div class="dropdown-menu"></div>
                 </div>
                 <div class="external-button" title="在新窗口打开翻译"></div>
+                <button type="button" class="unhighlight-button" title="取消当前单词高亮" hidden></button>
                 <div class="pin-button unpinned" title="固定窗口"></div>
                 <div class="theme-button light" title="切换深色模式"></div>
                 <div class="clear-button" title="关闭所有窗口"></div>
             </div>
+            <div class="loading-bar"></div>
             <div class="content"></div>`;
     }
 
-    function createTranslatorPanel() {
+    function createTranslatorPanel({
+        translatorKey = GM_getValue('defaultTranslator', 'youdao'),
+        translationText = '',
+        highlightElement = null,
+        resultHtml = ''
+    } = {}) {
         const targetPanel = document.createElement('div');
         targetPanel.className = 'translator-panel';
-        targetPanel.translatorKey = GM_getValue('defaultTranslator', 'youdao');
-        targetPanel.translationText = '';
-        targetPanel.innerHTML = buildPanelHTML(targetPanel.translatorKey);
+        targetPanel.translatorKey = translatorKey;
+        targetPanel.translationText = translationText;
+        targetPanel.requestId = 0;
+        targetPanel.anchorPoint = null;
+        targetPanel.manualPosition = false;
+        targetPanel.selectionBookmark = null;
+        targetPanel.highlightElement = highlightElement;
+        targetPanel.innerHTML = buildPanelHTML(translatorKey);
+        if (translationText && resultHtml) {
+            targetPanel.querySelector('.content').innerHTML = buildContentHTML(translationText, resultHtml);
+        }
+        setHighlightButton(targetPanel, Boolean(highlightElement));
         setupPanelEvents(targetPanel);
         return targetPanel;
     }
 
     const handleSelection = utils.debounce(async e => {
-        if (isTranslating || state.ignoreNextSelection) return;
+        if (isTranslating || state.ignoreNextSelection || utils.isEditableTarget(e.target)) return;
 
         const selection = window.getSelection();
-        const text = selection?.toString().trim();
-        if (!text || !utils.isTranslatable(text) || utils.isClickInPanel(e)) return;
-        if (!selection.rangeCount) return;
+        if (!selection?.rangeCount || utils.isClickInPanel(e)) return;
+
+        const rawText = selection.toString();
+        if (!rawText || !utils.isTranslatable(rawText)) return;
+
+        const translatorKey = GM_getValue('defaultTranslator', 'youdao');
+        const prepared = prepareSelection(rawText, translatorKey);
+        if (!prepared) return;
+
+        const selectedRange = selection.getRangeAt(0).cloneRange();
+        const originalBookmark = captureSelectionBookmark(selectedRange);
+        if (!originalBookmark) return;
+
+        const bookmark = {
+            container: originalBookmark.container,
+            start: originalBookmark.start + prepared.start,
+            end: originalBookmark.start + prepared.end,
+            text: prepared.text
+        };
+        const range = rangeFromBookmark(bookmark);
+        if (!range) return;
+        const rect = range.getBoundingClientRect();
 
         isTranslating = true;
         cleanupPanels();
         let targetPanel = null;
 
         try {
-            targetPanel = createTranslatorPanel();
+            targetPanel = createTranslatorPanel({translatorKey});
+            targetPanel.selectionBookmark = bookmark;
             document.body.appendChild(targetPanel);
 
-            const rect = selection.getRangeAt(0).getBoundingClientRect();
             utils.showPanel(rect.left + window.scrollX, rect.bottom + window.scrollY, targetPanel);
-            await translate(text, targetPanel);
+            await translate(prepared.text, targetPanel);
         } catch (error) {
             console.error('处理选中文本时出错:', error);
             if (targetPanel) utils.setError(error.message || '翻译失败，请稍后重试', targetPanel);
@@ -1179,6 +1617,21 @@
         }
     }, {passive: false});
 
+    document.addEventListener('mouseover', e => {
+        if (!(e.target instanceof Element)) return;
+        const span = e.target.closest('.popdict-highlight');
+        if (!span || span.contains(e.relatedTarget)) return;
+        clearTimeout(hoverHideTimer);
+        showHoverPanel(span);
+    });
+
+    document.addEventListener('mouseout', e => {
+        if (!(e.target instanceof Element)) return;
+        const span = e.target.closest('.popdict-highlight');
+        if (!span || span.contains(e.relatedTarget) || hoverPanel?.contains(e.relatedTarget)) return;
+        scheduleHideHover();
+    });
+
     function refreshOpenDropdowns() {
         document.querySelectorAll('.translator-panel').forEach(panel => panel.refreshDropdown?.());
     }
@@ -1208,6 +1661,7 @@
             if (show === targetPanel.isDropdownOpen) return;
             targetPanel.isDropdownOpen = show;
             switchIcon.classList.toggle('open', show);
+            titleWrapper.classList.toggle('open', show);
 
             if (show) {
                 updateDropdownMenu();
@@ -1277,7 +1731,7 @@
 
     function beginPanelDrag(e, targetPanel) {
         if (e.button !== 0 || !e.target.closest('.title-bar')) return;
-        if (e.target.closest('.title-wrapper, .pin-button, .theme-button, .clear-button, .external-button, .dropdown-menu')) return;
+        if (e.target.closest('.title-wrapper, .pin-button, .theme-button, .clear-button, .external-button, .unhighlight-button, .dropdown-menu')) return;
 
         const rect = targetPanel.getBoundingClientRect();
         dragState = {
@@ -1290,6 +1744,7 @@
             scrollY: window.scrollY
         };
         state.isDragging = true;
+        targetPanel.manualPosition = true;
         targetPanel.classList.add('dragging');
         e.preventDefault();
         e.stopPropagation();
@@ -1321,18 +1776,48 @@
         )}px`;
     });
 
+    function setupPanelActions(targetPanel) {
+        targetPanel.addEventListener('click', async e => {
+            const audioButton = e.target.closest('.audio-button');
+            if (audioButton) {
+                e.preventDefault();
+                e.stopPropagation();
+                utils.preventSelectionTrigger();
+                state.isSelectingInPanel = false;
+                if (audioButton.dataset.url) await audio.play(audioButton.dataset.url);
+                return;
+            }
+
+            if (e.target.closest('.unhighlight-button')) {
+                e.preventDefault();
+                e.stopPropagation();
+                removeHighlight(targetPanel.highlightElement);
+                return;
+            }
+
+            if (e.target.closest('.external-button')) {
+                e.preventDefault();
+                e.stopPropagation();
+                utils.preventSelectionTrigger();
+                const url = EXTERNAL_URLS[targetPanel.translatorKey];
+                if (url && targetPanel.translationText) {
+                    window.open(url + encodeURIComponent(targetPanel.translationText), '_blank');
+                }
+            }
+        });
+    }
+
     function setupPanelEvents(targetPanel) {
         setupTranslatorSwitch(targetPanel);
+        setupPanelActions(targetPanel);
 
         const pinButton = targetPanel.querySelector('.pin-button');
         const themeButton = targetPanel.querySelector('.theme-button');
-        const externalButton = targetPanel.querySelector('.external-button');
         const clearButton = targetPanel.querySelector('.clear-button');
         const isDark = utils.isDarkMode();
 
         themeButton.className = `theme-button ${isDark ? 'dark' : 'light'}`;
         themeButton.title = isDark ? '切换亮色模式' : '切换深色模式';
-        targetPanel.classList.toggle(CONFIG.darkModeClass, isDark);
 
         pinButton.addEventListener('click', e => {
             e.preventDefault();
@@ -1340,6 +1825,13 @@
             const pinned = targetPanel.classList.toggle('pinned');
             pinButton.className = `pin-button ${pinned ? 'pinned' : 'unpinned'}`;
             pinButton.title = pinned ? '取消固定' : '固定窗口';
+
+            // 悬浮窗一旦固定，就转为普通窗口，不再受鼠标离开自动关闭控制。
+            if (pinned && targetPanel === hoverPanel) {
+                clearTimeout(hoverHideTimer);
+                hoverHideTimer = null;
+                hoverPanel = null;
+            }
         });
 
         themeButton.addEventListener('click', e => {
@@ -1377,24 +1869,10 @@
             }
         });
 
-        externalButton.addEventListener('click', e => {
-            e.preventDefault();
-            e.stopPropagation();
-            utils.preventSelectionTrigger();
-            const urls = {
-                google: 'https://translate.google.com/?sl=auto&tl=zh-CN&text=',
-                youdao: 'https://dict.youdao.com/w/',
-                cambridge: 'https://dictionary.cambridge.org/dictionary/english-chinese-simplified/'
-            };
-            const url = urls[targetPanel.translatorKey];
-            if (url && targetPanel.translationText) {
-                window.open(url + encodeURIComponent(targetPanel.translationText), '_blank');
-            }
-        });
-
         clearButton.addEventListener('click', e => {
             e.preventDefault();
             e.stopPropagation();
+            hideHoverPanel(true);
             document.querySelectorAll('.translator-panel').forEach(panel => panel.remove());
             if (dragState) dragState.panel.classList.remove('dragging');
             dragState = null;
@@ -1409,6 +1887,13 @@
             });
         });
     }
+
+    // 浏览器窗口尺寸变化时，重新限制所有翻译窗口的高度和位置。
+    window.addEventListener('resize', utils.debounce(() => {
+        document.querySelectorAll('.translator-panel:not(.dragging)').forEach(panel => {
+            utils.fitPanelToViewport(panel);
+        });
+    }, 100));
 
     // 页面滚动后，仅在窗口完全离开视口时将其拉回可见区域。
     let scrollTimer = null;
