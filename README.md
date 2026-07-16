@@ -1,5 +1,7 @@
 # PopDict 词窗 - 划词翻译
 
+Sometimes the smallest decision can lead to an unexpected opportunity, especially when you are willing to step outside your comfort zone and try something completely new.
+
 ![gif](https://github.com/vlan20/PopDict/blob/main/img/demo-1-cambridge-dict.gif)
 
 一款简洁轻量的网页划词翻译脚本，支持有道词典、剑桥词典和谷歌翻译。
