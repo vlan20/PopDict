@@ -4,7 +4,7 @@ Sometimes the smallest decision can lead to an unexpected opportunity, especiall
 
 ![gif](https://github.com/vlan20/PopDict/blob/main/img/demo-1-cambridge-dict.gif)
 
-一款简洁轻量的网页划词翻译脚本，支持有道词典、剑桥词典和谷歌翻译。
+一款简洁轻量的网页划词翻译脚本，支持有道词典、剑桥词典和谷歌翻译。选中英文单词、词组或句子，即可快速查看翻译结果。
 
 ## 安装方法 / Install
 
@@ -17,7 +17,7 @@ Sometimes the smallest decision can lead to an unexpected opportunity, especiall
 ## 使用说明 / Usage
 
 - 双击或框选网页中的英文单词或词组即可查看中文释义，点击标题栏可切换翻译器。
-- 谷歌翻译支持句子及中英文混合内容。
+- 谷歌翻译支持句子及中英文混合内容，有道、剑桥词典适合翻译单词和词组。
 - 有道词典和剑桥词典查询成功后，会高亮当前单词，鼠标移至高亮词汇，可快速查看上次的翻译结果。
 - 支持英式、美式发音，以及窗口固定、拖动和主题切换。
 - 生词本功能，可查看当前页面所有查询过的单词，支持一键导出词汇列表及其释义。
