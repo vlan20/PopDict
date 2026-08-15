@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PopDict 词窗 - 划词翻译
 // @namespace    https://github.com/vlan20/popdict
-// @version      0.1.4
+// @version      0.1.5
 // @description  一款简洁轻量的网页划词翻译脚本，双击即译，支持有道词典、剑桥词典和谷歌翻译，适配Tampermonkey脚本管理器。
 // @author       vlan20
 // @license      MIT
@@ -44,12 +44,11 @@
         titleBarHeight: 40, // 添加标题栏高度配置
         animationDuration: 200, // 面板淡出时间
         loadingDelay: 120, // 超过该时间才显示加载条
-        hoverHideDelay: 80, // 高亮悬浮窗关闭延迟
+        hoverHideDelay: 300, // 离开高亮/悬浮窗后的关闭缓冲
+        hoverSwitchDelay: 200, // 掠过相邻高亮时延迟切换，避免误顶掉当前窗口
         cacheExpiration: 24 * 60 * 60 * 1000, // 缓存过期时间（24小时）
         maxCacheSize: 100, // 最大缓存条目数
     };
-
-    let isTranslating = false;
 
     // 翻译缓存系统
     const translationCache = {
@@ -150,7 +149,7 @@
         }
     };
 
-    // 统一 GET 请求；不伪造 User-Agent，剑桥单独使用匿名请求避开异常 Cookie 状态。
+    // 统一 GET 请求；剑桥单独使用匿名请求避开异常 Cookie 状态。
     const gmGet = (url, options = {}) => new Promise((resolve, reject) => {
         GM_xmlhttpRequest({
             method: 'GET',
@@ -164,7 +163,7 @@
     // 翻译器工厂函数
     const createTranslator = (name, translateFn) => ({
         name,
-        translate: async (text) => {
+        translate: async text => {
             const cachedResult = translationCache.get(text, name);
             if (cachedResult) return cachedResult;
 
@@ -199,7 +198,7 @@
 
                 const result = JSON.parse(response.responseText);
                 let translation = '';
-                const createPronHtml = (type, pron, url) => `<span class="phonetic-item">${type} /${pron}/ <button class="audio-button" data-url="${url}">🔊</button></span>`;
+                const createPronHtml = (type, pron, url) => `<span class="phonetic-item">${type} /${pron}/ <button class="audio-button" data-url="${url}">${ICONS.audio}</button></span>`;
                 const wordInfo = result.ec?.word?.[0];
                 const audioUrls = {
                     uk: wordInfo?.ukspeech ? `https://dict.youdao.com/dictvoice?audio=${wordInfo.ukspeech}` : '',
@@ -261,7 +260,7 @@
                     const audioUrls = Array.from(container.querySelectorAll('source[type="audio/mpeg"]')).map(el => getFullUrl(el.getAttribute('src')));
                     return { prons, audioUrls };
                 };
-                const createPronHtml = (type, pron, audioUrl) => `<span class="phonetic-item">${type} ${pron} <button class="audio-button" data-url="${audioUrl}">🔊</button></span>`;
+                const createPronHtml = (type, pron, audioUrl) => `<span class="phonetic-item">${type} ${pron} <button class="audio-button" data-url="${audioUrl}">${ICONS.audio}</button></span>`;
 
                 // 获取主要发音并添加
                 const mainUk = getPronunciations(doc.querySelector('.uk.dpron-i'));
@@ -369,19 +368,21 @@
         cambridge: 'https://dictionary.cambridge.org/dictionary/english-chinese-simplified/'
     };
 
+    const ICONS = {external: '🔎', eraser: '🧹', lock: '🔒', unlock: '🔓', moon: '🌙', sun: '🔆', close: '❌', trash: '📤', audio: '🔊'};
+
     // 添加样式
     GM_addStyle(`
         /* 主题变量与面板基础 */
         .translator-panel {
             --panel-bg: #fff;
-            --panel-text: #2c3e50;
+            --panel-text: #000;
             --panel-border: #e2e8f0;
             --panel-shadow: rgba(0, 0, 0, 0.1);
             --title-bg: #f8fafc;
-            --title-text: #334155;
+            --title-text: #000;
             --title-border: #e2e8f0;
-            --text-secondary: #475569;
-            --text-tertiary: #64748b;
+            --text-secondary: #111;
+            --text-tertiary: #333;
             --hover-bg: #f1f5f9;
             --title-hover-bg: #e2e8f0;
             --highlight-bg: rgba(245, 158, 11, 0.22);
@@ -526,205 +527,46 @@
             opacity: 0.8 !important;
         }
 
-        .translator-panel .switch-icon {
-            flex: 0 0 auto !important;
-            width: 8px !important;
-            height: 5px !important;
-            margin-left: 2px !important;
-            background: var(--text-tertiary) !important;
-            clip-path: polygon(0 0, 100% 0, 50% 100%) !important;
-            transform: rotate(0deg) !important;
-            transform-origin: center !important;
-            transition: transform 0.2s ease !important;
-        }
-
-        .translator-panel .switch-icon.open {
-            transform: rotate(180deg) !important;
-        }
-
         /* 标题栏图标按钮 */
         .translator-panel .theme-button,
         .translator-panel .pin-button,
         .translator-panel .clear-button,
         .translator-panel .external-button,
-        .translator-panel .unhighlight-button {
+        .translator-panel .unhighlight-button,
+        .translator-panel .wordbook-remove {
             display: flex !important;
             align-items: center !important;
             justify-content: center !important;
-            flex: 0 0 var(--font-xl) !important;
-            width: var(--font-xl) !important;
-            height: var(--font-xl) !important;
+            flex: 0 0 18px !important;
+            width: 18px !important;
+            height: 18px !important;
+            padding: 0 !important;
             border: 0 !important;
+            border-radius: 3px !important;
             background: transparent !important;
             color: var(--title-text) !important;
             cursor: pointer !important;
-            opacity: 0.62 !important;
-            transition: opacity 0.2s !important;
+            opacity: 0.82 !important;
+            font: 15px/1 "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif !important;
+            transition: background-color 0.15s, opacity 0.15s !important;
         }
 
         .translator-panel .theme-button:hover,
         .translator-panel .pin-button:hover,
         .translator-panel .clear-button:hover,
         .translator-panel .external-button:hover,
-        .translator-panel .unhighlight-button:hover {
+        .translator-panel .unhighlight-button:hover,
+        .translator-panel .wordbook-remove:hover {
+            background: var(--title-hover-bg) !important;
+            opacity: 1 !important;
+        }
+
+        .translator-panel .pin-button.pinned {
             opacity: 1 !important;
         }
 
         .translator-panel .unhighlight-button[hidden] {
             display: none !important;
-        }
-
-        .translator-panel .theme-button,
-        .translator-panel .pin-button,
-        .translator-panel .clear-button,
-        .translator-panel .external-button,
-        .translator-panel .unhighlight-button {
-            position: relative !important;
-        }
-
-        .translator-panel .theme-button::before,
-        .translator-panel .theme-button::after,
-        .translator-panel .pin-button::before,
-        .translator-panel .pin-button::after,
-        .translator-panel .clear-button::before,
-        .translator-panel .clear-button::after,
-        .translator-panel .external-button::before,
-        .translator-panel .external-button::after,
-        .translator-panel .unhighlight-button::before,
-        .translator-panel .unhighlight-button::after {
-            content: "" !important;
-            position: absolute !important;
-            display: block !important;
-            box-sizing: border-box !important;
-            pointer-events: none !important;
-        }
-
-        /* 固定：圆形图钉，固定后填充 */
-        .translator-panel .pin-button::before {
-            top: 1px !important;
-            left: 4px !important;
-            width: 8px !important;
-            height: 8px !important;
-            border: 1.5px solid currentColor !important;
-            border-radius: 50% !important;
-        }
-
-        .translator-panel .pin-button::after {
-            top: 8px !important;
-            left: 7px !important;
-            width: 2px !important;
-            height: 8px !important;
-            border-radius: 1px !important;
-            background: currentColor !important;
-        }
-
-        .translator-panel .pin-button.pinned::before {
-            background: currentColor !important;
-        }
-
-        /* 主题：亮色状态显示月亮，暗色状态显示太阳 */
-        .translator-panel .theme-button.light::before {
-            top: 1px !important;
-            left: 1px !important;
-            width: 14px !important;
-            height: 14px !important;
-            border: 1.5px solid currentColor !important;
-            border-radius: 50% !important;
-        }
-
-        .translator-panel .theme-button.light::after {
-            top: -1px !important;
-            left: 6px !important;
-            width: 11px !important;
-            height: 11px !important;
-            border-radius: 50% !important;
-            background: var(--title-bg) !important;
-        }
-
-        .translator-panel .theme-button.dark::before {
-            top: 4px !important;
-            left: 4px !important;
-            width: 8px !important;
-            height: 8px !important;
-            border: 1.5px solid currentColor !important;
-            border-radius: 50% !important;
-        }
-
-        .translator-panel .theme-button.dark::after {
-            top: 0 !important;
-            left: 7px !important;
-            width: 2px !important;
-            height: 2px !important;
-            border-radius: 1px !important;
-            background: currentColor !important;
-            box-shadow:
-                0 14px 0 currentColor,
-                -7px 7px 0 currentColor,
-                7px 7px 0 currentColor,
-                -5px 2px 0 currentColor,
-                5px 2px 0 currentColor,
-                -5px 12px 0 currentColor,
-                5px 12px 0 currentColor !important;
-        }
-
-        /* 关闭：两条交叉线 */
-        .translator-panel .clear-button::before,
-        .translator-panel .clear-button::after {
-            top: 7px !important;
-            left: 1px !important;
-            width: 14px !important;
-            height: 2px !important;
-            border-radius: 1px !important;
-            background: currentColor !important;
-        }
-
-        .translator-panel .clear-button::before {
-            transform: rotate(45deg) !important;
-        }
-
-        .translator-panel .clear-button::after {
-            transform: rotate(-45deg) !important;
-        }
-
-        /* 外部打开：方框与右上箭头 */
-        .translator-panel .external-button::before {
-            left: 1px !important;
-            bottom: 1px !important;
-            width: 11px !important;
-            height: 11px !important;
-            border: 1.5px solid currentColor !important;
-            border-radius: 2px !important;
-        }
-
-        .translator-panel .external-button::after {
-            top: 0 !important;
-            right: 0 !important;
-            width: 9px !important;
-            height: 9px !important;
-            border-top: 1.5px solid currentColor !important;
-            border-right: 1.5px solid currentColor !important;
-            background: linear-gradient(135deg,
-                transparent 43%, currentColor 44%, currentColor 56%, transparent 57%) !important;
-        }
-
-        /* 取消高亮：倾斜橡皮擦 */
-        .translator-panel .unhighlight-button::before {
-            top: 3px !important;
-            left: 2px !important;
-            width: 12px !important;
-            height: 8px !important;
-            border: 1.5px solid currentColor !important;
-            border-radius: 2px !important;
-            transform: rotate(-45deg) !important;
-        }
-
-        .translator-panel .unhighlight-button::after {
-            top: 12px !important;
-            left: 2px !important;
-            width: 12px !important;
-            height: 1.5px !important;
-            border-radius: 1px !important;
-            background: currentColor !important;
         }
 
         /* 翻译器下拉菜单 */
@@ -875,6 +717,98 @@
             background: var(--highlight-hover-bg, rgba(245, 158, 11, 0.38)) !important;
         }
 
+        .popdict-highlight.popdict-jump-target {
+            outline: 2px solid rgba(59, 130, 246, 0.75) !important;
+            outline-offset: 2px !important;
+        }
+
+        /* 页面高亮词汇 */
+        .popdict-wordbook-button {
+            position: fixed !important;
+            right: 18px !important;
+            bottom: 18px !important;
+            z-index: 2147483646 !important;
+            min-width: 52px !important;
+            height: 34px !important;
+            padding: 0 12px !important;
+            border: 1px solid #d1d5db !important;
+            border-radius: 17px !important;
+            background: #fff !important;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12) !important;
+            color: #111 !important;
+            font: 500 14px/1 sans-serif !important;
+            cursor: pointer !important;
+        }
+
+        .popdict-wordbook-button:hover { background: #f1f5f9 !important; }
+        .popdict-wordbook-button.dark {
+            border-color: #333 !important;
+            background: #1a1a1a !important;
+            color: #e0e0e0 !important;
+        }
+        .popdict-wordbook-button.dark:hover { background: #2c2c2c !important; }
+
+        .translator-panel.popdict-wordbook-panel {
+            position: fixed !important;
+            right: 18px !important;
+            bottom: 62px !important;
+            left: auto !important;
+            top: auto !important;
+            display: flex !important;
+            width: max-content !important;
+            min-width: 210px !important;
+            max-width: min(340px, calc(100vw - 24px)) !important;
+            max-height: min(60vh, 420px) !important;
+            opacity: 1 !important;
+            transform: none !important;
+        }
+
+        .popdict-wordbook-panel .title-bar {
+            margin-bottom: 0 !important;
+            cursor: default !important;
+        }
+
+        .popdict-wordbook-panel .wordbook-title { margin-right: auto !important; }
+        .popdict-wordbook-panel .wordbook-export {
+            border: 0 !important;
+            background: transparent !important;
+            color: var(--title-text) !important;
+            font-size: var(--font-sm) !important;
+            cursor: pointer !important;
+            opacity: 0.68 !important;
+        }
+        .popdict-wordbook-panel .wordbook-export:hover { opacity: 1 !important; }
+        .popdict-wordbook-panel .wordbook-list { padding: 3px !important; }
+        .popdict-wordbook-panel .wordbook-item {
+            gap: var(--spacing-sm) !important;
+            padding: 3px 6px !important;
+            border-radius: var(--spacing-sm) !important;
+            font-size: 14px !important;
+            line-height: 1.25 !important;
+        }
+        .popdict-wordbook-panel .wordbook-word {
+            flex: 1 1 auto !important;
+            min-width: 0 !important;
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+            white-space: nowrap !important;
+        }
+        .popdict-wordbook-panel .wordbook-count {
+            flex: 0 0 auto !important;
+            color: var(--text-tertiary) !important;
+            font-size: var(--font-sm) !important;
+        }
+        .popdict-wordbook-panel .wordbook-remove {
+            color: var(--panel-text) !important;
+            opacity: 0 !important;
+            visibility: hidden !important;
+        }
+        .popdict-wordbook-panel .wordbook-item:hover .wordbook-remove,
+        .popdict-wordbook-panel .wordbook-remove:focus-visible {
+            opacity: 1 !important;
+            visibility: visible !important;
+        }
+
         /* 翻译内容 */
         .translator-panel .content {
             position: relative !important;
@@ -971,13 +905,15 @@
             border-radius: var(--spacing-xs) !important;
             background: transparent !important;
             color: var(--active-link) !important;
-            font-size: var(--font-xl) !important;
+            font: var(--font-lg)/1 "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif !important;
             cursor: pointer !important;
-            transition: background-color 0.2s, transform 0.2s !important;
+            opacity: 0.82 !important;
+            transition: background-color 0.15s, opacity 0.15s, transform 0.2s !important;
         }
 
         .translator-panel .audio-button:hover {
             background: var(--hover-bg) !important;
+            opacity: 1 !important;
         }
 
         .translator-panel .audio-button:active {
@@ -1092,18 +1028,35 @@
 
     // 仅保留跨窗口共享且确实需要的状态。
     const state = {
-        isDragging: false,
         lastClickTime: 0,
         clickCount: 0,
         ignoreNextSelection: false,
         isSelectingInPanel: false,
-        isRightClickPending: false
+        isRightClickPending: false,
+        selectionStartedInEditable: false
     };
 
     let dragState = null;
     let hoverPanel = null;
     let hoverHideTimer = null;
+    let hoverShowTimer = null;
+    let wordbookButton = null;
+    let wordbookPanel = null;
+    const wordbookCursor = new Map();
     const highlightStore = new WeakMap();
+
+    function updateThemeButton(button, isDark) {
+        if (!button) return;
+        button.title = isDark ? '切换亮色模式' : '切换深色模式';
+        button.textContent = isDark ? ICONS.sun : ICONS.moon;
+    }
+
+    function updatePinButton(button, pinned) {
+        if (!button) return;
+        button.classList.toggle('pinned', pinned);
+        button.title = pinned ? '取消固定' : '固定窗口';
+        button.textContent = pinned ? ICONS.unlock : ICONS.lock;
+    }
 
     const utils = {
         escapeMap: {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'},
@@ -1114,12 +1067,9 @@
             GM_setValue('darkMode', isDark);
             document.querySelectorAll('.translator-panel').forEach(panel => {
                 panel.classList.toggle(CONFIG.darkModeClass, isDark);
-                const button = panel.querySelector('.theme-button');
-                if (button) {
-                    button.className = `theme-button ${isDark ? 'dark' : 'light'}`;
-                    button.title = isDark ? '切换亮色模式' : '切换深色模式';
-                }
+                updateThemeButton(panel.querySelector('.theme-button'), isDark);
             });
+            document.querySelector('.popdict-wordbook-button')?.classList.toggle('dark', isDark);
         },
         debounce(fn, delay) {
             let timer;
@@ -1222,7 +1172,13 @@
         isEditableTarget: target => target instanceof Element && Boolean(
             target.closest('input, textarea, select, option, [contenteditable]:not([contenteditable="false"])')
         ),
-        isClickInPanel: e => e.target instanceof Element && Boolean(e.target.closest('.translator-panel')),
+        isClickInPanel: e => e.target instanceof Element && Boolean(
+            e.target.closest('.translator-panel, .popdict-wordbook-button')
+        ),
+        stopEvent(e) {
+            e.preventDefault();
+            e.stopPropagation();
+        },
         preventSelectionTrigger() {
             state.ignoreNextSelection = true;
             setTimeout(() => { state.ignoreNextSelection = false; }, 100);
@@ -1260,7 +1216,7 @@
     function prepareSelection(text, translatorKey) {
         const leading = text.length - text.trimStart().length;
         const trimmed = text.trim();
-        if (!trimmed) return null;
+        if (!trimmed || /^[A-Za-z]$/.test(trimmed.replace(/[\p{P}\p{S}]/gu, ''))) return null;
 
         if (translatorKey === 'google') {
             return { text: trimmed, start: leading, end: leading + trimmed.length };
@@ -1280,6 +1236,7 @@
             candidate = matches[0][0];
             relativeStart = matches[0].index;
         }
+        if (/^[A-Za-z]$/.test(candidate)) return null;
 
         const words = candidate.match(/[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*/g) || [];
         const isDictionaryPhrase = words.length >= 1
@@ -1319,7 +1276,159 @@
         if (button) button.hidden = !visible;
     }
 
-    function removeHighlight(span) {
+    function getWordbookGroups() {
+        const groups = new Map();
+        document.querySelectorAll('.popdict-highlight').forEach(span => {
+            const data = highlightStore.get(span);
+            const text = (data?.text || span.textContent).trim();
+            if (!text) return;
+            if (!groups.has(text)) groups.set(text, {text, spans: []});
+            groups.get(text).spans.push(span);
+        });
+        return Array.from(groups.values());
+    }
+
+    function renderWordbook(groups) {
+        wordbookPanel.items = groups;
+        wordbookPanel.querySelector('.wordbook-title').textContent = `页面高亮词汇（${groups.length}）`;
+        wordbookPanel.querySelector('.wordbook-list').innerHTML = groups.map((group, index) => `
+            <div class="dropdown-item wordbook-item" data-index="${index}">
+                <span class="wordbook-word">${utils.escapeHtml(group.text)}</span>
+                ${group.spans.length > 1 ? `<span class="wordbook-count">×${group.spans.length}</span>` : ''}
+                <button type="button" class="wordbook-remove" title="取消一处高亮" aria-label="取消一处高亮">${ICONS.trash}</button>
+            </div>`).join('');
+    }
+
+    function plainTranslation(html = '') {
+        const container = document.createElement('div');
+        container.innerHTML = html;
+        container.querySelectorAll('.audio-button, .phonetic-buttons, .sense-phonetic').forEach(element => element.remove());
+        container.querySelectorAll('br').forEach(br => br.replaceWith('\n'));
+        container.querySelectorAll('.sense-block').forEach(block => block.append('\n'));
+        return container.textContent
+            .replace(/[ \t]+/g, ' ')
+            .replace(/ *\n */g, '\n')
+            .replace(/\n{2,}/g, '\n')
+            .trim();
+    }
+
+    function exportWordbook() {
+        const groups = getWordbookGroups();
+        if (!groups.length) return;
+        const csvCell = value => `"${String(value).replace(/"/g, '""')}"`;
+        const rows = [['Word', 'Translation', 'Count'], ...groups.map(group => [
+            group.text, plainTranslation(highlightStore.get(group.spans[0])?.html), group.spans.length
+        ])];
+        const csv = '\uFEFF' + rows.map(row => row.map(csvCell).join(',')).join('\r\n') + '\r\n';
+        const url = URL.createObjectURL(new Blob([csv], {type: 'text/csv;charset=utf-8'}));
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = 'popdict-vocabulary.csv';
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 0);
+    }
+
+    function focusWordbookHighlight(span) {
+        if (!span?.isConnected) return;
+        span.scrollIntoView({behavior: 'smooth', block: 'center', inline: 'nearest'});
+        span.classList.add('popdict-jump-target');
+        setTimeout(() => span.classList.remove('popdict-jump-target'), 900);
+
+        const ownerPanel = highlightStore.get(span)?.ownerPanel;
+        if (ownerPanel?.isConnected && !ownerPanel.classList.contains('pinned')) {
+            ownerPanel.remove();
+        }
+        showHoverPanel(span);
+    }
+
+    function closeWordbook() {
+        wordbookPanel?.remove();
+        wordbookPanel = null;
+    }
+
+    function toggleWordbook() {
+        if (wordbookPanel && !wordbookPanel.isConnected) wordbookPanel = null;
+        if (wordbookPanel) {
+            closeWordbook();
+            return;
+        }
+
+        const groups = getWordbookGroups();
+        if (!groups.length) return;
+        wordbookPanel = document.createElement('div');
+        wordbookPanel.className = 'translator-panel pinned popdict-wordbook-panel';
+        wordbookPanel.classList.toggle(CONFIG.darkModeClass, utils.isDarkMode());
+        wordbookPanel.innerHTML = `<div class="title-bar">
+                <span class="title wordbook-title"></span>
+                <button type="button" class="wordbook-export" title="导出词表（CSV，可用 Excel、WPS 或记事本打开）">导出词表</button>
+                <button type="button" class="clear-button wordbook-close" title="关闭" aria-label="关闭">${ICONS.close}</button>
+            </div>
+            <div class="translation-container wordbook-list"></div>`;
+        document.body.appendChild(wordbookPanel);
+        renderWordbook(groups);
+
+        wordbookPanel.addEventListener('click', e => {
+            utils.stopEvent(e);
+            if (e.target.closest('.wordbook-close')) {
+                closeWordbook();
+                return;
+            }
+            if (e.target.closest('.wordbook-export')) {
+                exportWordbook();
+                return;
+            }
+
+            const item = e.target.closest('.wordbook-item');
+            if (!item) return;
+            const group = wordbookPanel.items?.[Number(item.dataset.index)];
+            if (!group?.spans.length) {
+                updateWordbookUI();
+                return;
+            }
+
+            let index = wordbookCursor.get(group.text) ?? -1;
+            if (e.target.closest('.wordbook-remove')) {
+                index = index >= 0 && index < group.spans.length ? index : 0;
+                wordbookCursor.set(group.text, index - 1);
+                removeHighlight(group.spans[index]);
+                return;
+            }
+
+            index = (index + 1) % group.spans.length;
+            wordbookCursor.set(group.text, index);
+            focusWordbookHighlight(group.spans[index]);
+        });
+    }
+
+    function updateWordbookUI() {
+        const groups = getWordbookGroups();
+        if (!groups.length) {
+            wordbookButton?.remove();
+            wordbookButton = null;
+            closeWordbook();
+            wordbookCursor.clear();
+            return;
+        }
+
+        if (!wordbookButton?.isConnected) {
+            wordbookButton = document.createElement('button');
+            wordbookButton.type = 'button';
+            wordbookButton.className = 'popdict-wordbook-button';
+            wordbookButton.addEventListener('click', e => {
+                utils.stopEvent(e);
+                toggleWordbook();
+            });
+            document.body.appendChild(wordbookButton);
+        }
+        wordbookButton.textContent = `词 ${groups.length}`;
+        wordbookButton.title = `页面高亮词汇（${groups.length}）`;
+        wordbookButton.classList.toggle('dark', utils.isDarkMode());
+
+        if (wordbookPanel && !wordbookPanel.isConnected) wordbookPanel = null;
+        if (wordbookPanel) renderWordbook(groups);
+    }
+
+    function removeHighlight(span, refreshWordbook = true) {
         if (!span?.isConnected) return;
         const data = highlightStore.get(span);
         if (data?.ownerPanel?.highlightElement === span) {
@@ -1331,6 +1440,7 @@
         const parent = span.parentNode;
         span.replaceWith(...span.childNodes);
         parent?.normalize();
+        if (refreshWordbook) updateWordbookUI();
     }
 
     function applyHighlight(bookmark, result, targetPanel) {
@@ -1341,7 +1451,7 @@
         container.querySelectorAll('.popdict-highlight').forEach(span => {
             const spanStart = getTextOffset(container, span, 0);
             const spanEnd = spanStart + span.textContent.length;
-            if (spanStart < end && spanEnd > start) removeHighlight(span);
+            if (spanStart < end && spanEnd > start) removeHighlight(span, false);
         });
 
         const range = rangeFromBookmark(bookmark);
@@ -1360,21 +1470,28 @@
         });
         targetPanel.highlightElement = span;
         setHighlightButton(targetPanel, true);
+        updateWordbookUI();
         return span;
     }
 
-    function hideHoverPanel(force = false) {
+    function hideHoverPanel() {
         clearTimeout(hoverHideTimer);
-        hoverHideTimer = null;
-        if (!hoverPanel) return;
-        if (!force && hoverPanel.classList.contains('pinned')) return;
-        hoverPanel.remove();
+        clearTimeout(hoverShowTimer);
+        hoverHideTimer = hoverShowTimer = null;
+        if (hoverPanel) hoverPanel.remove();
         hoverPanel = null;
     }
 
     function scheduleHideHover() {
         clearTimeout(hoverHideTimer);
         hoverHideTimer = setTimeout(hideHoverPanel, CONFIG.hoverHideDelay);
+    }
+
+    function requestHoverPanel(span) {
+        clearTimeout(hoverHideTimer);
+        clearTimeout(hoverShowTimer);
+        if (!hoverPanel || hoverPanel.highlightElement === span) return showHoverPanel(span);
+        hoverShowTimer = setTimeout(() => span.isConnected && showHoverPanel(span), CONFIG.hoverSwitchDelay);
     }
 
     function showHoverPanel(span) {
@@ -1394,7 +1511,10 @@
         document.body.appendChild(panel);
         highlightStore.set(span, {...data, ownerPanel: panel});
 
-        panel.addEventListener('mouseenter', () => clearTimeout(hoverHideTimer));
+        panel.addEventListener('mouseenter', () => {
+            clearTimeout(hoverHideTimer);
+            clearTimeout(hoverShowTimer);
+        });
         panel.addEventListener('mouseleave', e => {
             if (!panel.classList.contains('pinned') && e.relatedTarget !== span) scheduleHideHover();
         });
@@ -1427,7 +1547,7 @@
 
         try {
             const result = await translator.translate(textToTranslate);
-            if (requestId !== targetPanel.requestId) return null;
+            if (requestId !== targetPanel.requestId || !targetPanel.isConnected) return null;
 
             const content = targetPanel.querySelector('.content');
             if (!content) throw new Error('未找到内容容器元素');
@@ -1465,25 +1585,24 @@
                 <div class="title-wrapper">
                     <span class="title">${TRANSLATORS[translatorKey].name}</span>
                     <span class="switch-text">（点击切换）</span>
-                    <span class="switch-icon" aria-hidden="true"></span>
                     <div class="dropdown-menu"></div>
                 </div>
-                <div class="external-button" title="在新窗口打开翻译"></div>
-                <button type="button" class="unhighlight-button" title="取消当前单词高亮" hidden></button>
-                <div class="pin-button unpinned" title="固定窗口"></div>
-                <div class="theme-button light" title="切换深色模式"></div>
-                <div class="clear-button" title="关闭所有窗口"></div>
+                <button type="button" class="external-button" title="前往翻译网站查看" aria-label="前往翻译网站查看">${ICONS.external}</button>
+                <button type="button" class="unhighlight-button" title="取消高亮" aria-label="取消高亮" hidden>${ICONS.eraser}</button>
+                <button type="button" class="pin-button" title="固定窗口" aria-label="固定窗口">${ICONS.lock}</button>
+                <button type="button" class="theme-button" title="切换深色模式" aria-label="切换主题"></button>
+                <button type="button" class="clear-button" title="关闭所有窗口" aria-label="关闭所有窗口">${ICONS.close}</button>
             </div>
             <div class="loading-bar"></div>
             <div class="content"></div>`;
     }
 
     function createTranslatorPanel({
-        translatorKey = GM_getValue('defaultTranslator', 'youdao'),
+        translatorKey,
         translationText = '',
         highlightElement = null,
         resultHtml = ''
-    } = {}) {
+    }) {
         const targetPanel = document.createElement('div');
         targetPanel.className = 'translator-panel';
         targetPanel.translatorKey = translatorKey;
@@ -1502,11 +1621,11 @@
         return targetPanel;
     }
 
-    const handleSelection = utils.debounce(async e => {
-        if (isTranslating || state.ignoreNextSelection || utils.isEditableTarget(e.target)) return;
+    const handleSelection = utils.debounce(async () => {
+        if (state.ignoreNextSelection) return;
 
         const selection = window.getSelection();
-        if (!selection?.rangeCount || utils.isClickInPanel(e)) return;
+        if (!selection?.rangeCount) return;
 
         const rawText = selection.toString();
         if (!rawText || !utils.isTranslatable(rawText)) return;
@@ -1529,7 +1648,6 @@
         if (!range) return;
         const rect = range.getBoundingClientRect();
 
-        isTranslating = true;
         cleanupPanels();
         let targetPanel = null;
 
@@ -1542,17 +1660,15 @@
             await translate(prepared.text, targetPanel);
         } catch (error) {
             console.error('处理选中文本时出错:', error);
-            if (targetPanel) utils.setError(error.message || '翻译失败，请稍后重试', targetPanel);
-        } finally {
-            isTranslating = false;
+            if (targetPanel?.isConnected) utils.setError(error.message || '翻译失败，请稍后重试', targetPanel);
         }
     }, CONFIG.triggerDelay);
 
     const eventHandlers = {
         handleMouseDown(e) {
+            if (e.button === 0) state.selectionStartedInEditable = utils.isEditableTarget(e.target);
             if (state.isSelectingInPanel) {
-                e.stopPropagation();
-                e.preventDefault();
+                utils.stopEvent(e);
                 return;
             }
             if (e.button === 2) {
@@ -1566,19 +1682,18 @@
             if (state.clickCount >= 3) utils.preventSelectionTrigger();
         },
         handleMouseUp(e) {
+            const startedInEditable = state.selectionStartedInEditable;
+            state.selectionStartedInEditable = false;
             if (dragState) {
                 dragState.panel.classList.remove('dragging');
                 dragState = null;
-                state.isDragging = false;
                 utils.preventSelectionTrigger();
-                e.stopPropagation();
-                e.preventDefault();
+                utils.stopEvent(e);
                 return;
             }
             if (state.isSelectingInPanel) {
                 resetPanelSelection();
-                e.stopPropagation();
-                e.preventDefault();
+                utils.stopEvent(e);
                 return;
             }
             if (state.isRightClickPending && e.button === 0) {
@@ -1591,19 +1706,22 @@
                 state.isRightClickPending = false;
                 return;
             }
-            if (utils.isClickInPanel(e) || state.isDragging) {
+            if (utils.isClickInPanel(e)) {
                 utils.preventSelectionTrigger();
                 return;
             }
-            handleSelection(e);
+            if (startedInEditable || utils.isEditableTarget(e.target)) {
+                utils.preventSelectionTrigger();
+                return;
+            }
+            handleSelection();
         },
         handleOutsideClick(e) {
             if (state.isSelectingInPanel) {
-                e.stopPropagation();
-                e.preventDefault();
+                utils.stopEvent(e);
                 return;
             }
-            if (state.isRightClickPending || state.isDragging || utils.isClickInPanel(e)) return;
+            if (state.isRightClickPending || dragState || utils.isClickInPanel(e)) return;
             document.querySelectorAll('.translator-panel:not(.pinned)').forEach(utils.hidePanel);
         }
     };
@@ -1621,15 +1739,15 @@
         if (!(e.target instanceof Element)) return;
         const span = e.target.closest('.popdict-highlight');
         if (!span || span.contains(e.relatedTarget)) return;
-        clearTimeout(hoverHideTimer);
-        showHoverPanel(span);
+        requestHoverPanel(span);
     });
 
     document.addEventListener('mouseout', e => {
         if (!(e.target instanceof Element)) return;
         const span = e.target.closest('.popdict-highlight');
-        if (!span || span.contains(e.relatedTarget) || hoverPanel?.contains(e.relatedTarget)) return;
-        scheduleHideHover();
+        if (!span || span.contains(e.relatedTarget)) return;
+        clearTimeout(hoverShowTimer);
+        if (!hoverPanel?.contains(e.relatedTarget)) scheduleHideHover();
     });
 
     function refreshOpenDropdowns() {
@@ -1639,7 +1757,6 @@
     function setupTranslatorSwitch(targetPanel) {
         const titleWrapper = targetPanel.querySelector('.title-wrapper');
         const title = targetPanel.querySelector('.title');
-        const switchIcon = targetPanel.querySelector('.switch-icon');
         const dropdownMenu = targetPanel.querySelector('.dropdown-menu');
         targetPanel.isDropdownOpen = false;
 
@@ -1660,7 +1777,6 @@
         const toggleDropdown = show => {
             if (show === targetPanel.isDropdownOpen) return;
             targetPanel.isDropdownOpen = show;
-            switchIcon.classList.toggle('open', show);
             titleWrapper.classList.toggle('open', show);
 
             if (show) {
@@ -1692,14 +1808,12 @@
         });
 
         titleWrapper.addEventListener('click', e => {
-            e.preventDefault();
-            e.stopPropagation();
+            utils.stopEvent(e);
             toggleDropdown(!targetPanel.isDropdownOpen);
         });
 
         dropdownMenu.addEventListener('click', e => {
-            e.preventDefault();
-            e.stopPropagation();
+            utils.stopEvent(e);
             const item = e.target.closest('.dropdown-item');
             if (!item) return;
 
@@ -1743,11 +1857,9 @@
             scrollX: window.scrollX,
             scrollY: window.scrollY
         };
-        state.isDragging = true;
         targetPanel.manualPosition = true;
         targetPanel.classList.add('dragging');
-        e.preventDefault();
-        e.stopPropagation();
+        utils.stopEvent(e);
     }
 
     // 所有窗口共用一组文档级拖动监听器，避免新窗口覆盖旧窗口的监听器。
@@ -1756,7 +1868,6 @@
         const {panel, startX, startY, startLeft, startTop, scrollX, scrollY} = dragState;
         if (!panel.isConnected) {
             dragState = null;
-            state.isDragging = false;
             return;
         }
 
@@ -1780,8 +1891,7 @@
         targetPanel.addEventListener('click', async e => {
             const audioButton = e.target.closest('.audio-button');
             if (audioButton) {
-                e.preventDefault();
-                e.stopPropagation();
+                utils.stopEvent(e);
                 utils.preventSelectionTrigger();
                 state.isSelectingInPanel = false;
                 if (audioButton.dataset.url) await audio.play(audioButton.dataset.url);
@@ -1789,15 +1899,13 @@
             }
 
             if (e.target.closest('.unhighlight-button')) {
-                e.preventDefault();
-                e.stopPropagation();
+                utils.stopEvent(e);
                 removeHighlight(targetPanel.highlightElement);
                 return;
             }
 
             if (e.target.closest('.external-button')) {
-                e.preventDefault();
-                e.stopPropagation();
+                utils.stopEvent(e);
                 utils.preventSelectionTrigger();
                 const url = EXTERNAL_URLS[targetPanel.translatorKey];
                 if (url && targetPanel.translationText) {
@@ -1816,15 +1924,13 @@
         const clearButton = targetPanel.querySelector('.clear-button');
         const isDark = utils.isDarkMode();
 
-        themeButton.className = `theme-button ${isDark ? 'dark' : 'light'}`;
-        themeButton.title = isDark ? '切换亮色模式' : '切换深色模式';
+        updateThemeButton(themeButton, isDark);
+        updatePinButton(pinButton, targetPanel.classList.contains('pinned'));
 
         pinButton.addEventListener('click', e => {
-            e.preventDefault();
-            e.stopPropagation();
+            utils.stopEvent(e);
             const pinned = targetPanel.classList.toggle('pinned');
-            pinButton.className = `pin-button ${pinned ? 'pinned' : 'unpinned'}`;
-            pinButton.title = pinned ? '取消固定' : '固定窗口';
+            updatePinButton(pinButton, pinned);
 
             // 悬浮窗一旦固定，就转为普通窗口，不再受鼠标离开自动关闭控制。
             if (pinned && targetPanel === hoverPanel) {
@@ -1835,8 +1941,7 @@
         });
 
         themeButton.addEventListener('click', e => {
-            e.preventDefault();
-            e.stopPropagation();
+            utils.stopEvent(e);
             utils.toggleDarkMode();
         });
 
@@ -1863,34 +1968,33 @@
         targetPanel.addEventListener('contextmenu', e => {
             const selection = window.getSelection();
             if (selection?.isCollapsed || !e.target.closest('.content')) {
-                e.preventDefault();
-                e.stopPropagation();
+                utils.stopEvent(e);
                 document.querySelectorAll('.translator-panel:not(.pinned)').forEach(utils.hidePanel);
             }
         });
 
         clearButton.addEventListener('click', e => {
-            e.preventDefault();
-            e.stopPropagation();
-            hideHoverPanel(true);
+            utils.stopEvent(e);
+            hideHoverPanel();
             document.querySelectorAll('.translator-panel').forEach(panel => panel.remove());
+            wordbookPanel = null;
             if (dragState) dragState.panel.classList.remove('dragging');
             dragState = null;
             document.body.style.userSelect = '';
             Object.assign(state, {
-                isDragging: false,
-                lastClickTime: 0,
+                        lastClickTime: 0,
                 clickCount: 0,
                 ignoreNextSelection: false,
                 isSelectingInPanel: false,
-                isRightClickPending: false
+                isRightClickPending: false,
+                selectionStartedInEditable: false
             });
         });
     }
 
     // 浏览器窗口尺寸变化时，重新限制所有翻译窗口的高度和位置。
     window.addEventListener('resize', utils.debounce(() => {
-        document.querySelectorAll('.translator-panel:not(.dragging)').forEach(panel => {
+        document.querySelectorAll('.translator-panel:not(.dragging):not(.popdict-wordbook-panel)').forEach(panel => {
             utils.fitPanelToViewport(panel);
         });
     }, 100));
@@ -1901,7 +2005,7 @@
         if (scrollTimer) return;
         scrollTimer = setTimeout(() => {
             scrollTimer = null;
-            document.querySelectorAll('.translator-panel:not(.dragging)').forEach(panel => {
+            document.querySelectorAll('.translator-panel:not(.dragging):not(.popdict-wordbook-panel)').forEach(panel => {
                 if (!panel.isConnected || panel.style.display === 'none') return;
                 const rect = panel.getBoundingClientRect();
                 const outside = rect.right < CONFIG.panelSpacing
