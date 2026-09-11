@@ -4,7 +4,7 @@ Sometimes the smallest decision can lead to an unexpected opportunity, especiall
 
 ![gif](https://github.com/vlan20/PopDict/blob/main/img/demo-1-cambridge-dict.gif)
 
-一款简洁轻量的网页划词翻译脚本，支持有道词典、剑桥词典和谷歌翻译。选中英文单词、词组或句子，即可快速查看翻译结果。
+一款简洁轻量的网页中英划词翻译脚本，支持有道词典、剑桥词典和谷歌翻译。选中英文单词、词组或句子，即可快速查看翻译结果。
 
 ## 安装方法 / Install
 
