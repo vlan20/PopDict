@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PopDict 词窗 - 划词翻译
 // @namespace    https://github.com/vlan20/popdict
-// @version      0.1.6
+// @version      0.1.7
 // @description  一款简洁轻量的网页划词翻译脚本，双击即译，支持有道词典、剑桥词典和谷歌翻译，适配Tampermonkey脚本管理器。
 // @author       vlan20
 // @license      MIT
@@ -30,8 +30,27 @@
 (() => {
     'use strict';
 
+    // 静默启动：真实左键操作前仅注册入口，不读取页面/设置，不注入样式或联网。
+    function activate(event) {
+        if (!event.isTrusted || event.button !== 0) return;
+        document.removeEventListener('mousedown', activate, true);
+        initialize(event);
+    }
+    document.addEventListener('mousedown', activate, true);
+
+    function initialize(firstEvent) {
+    // 页面脚本 dispatchEvent()/click() 不能触发本脚本的查询、播放或导出。
+    const on = (target, type, handler, options) => target.addEventListener(type, event => {
+        if (event.isTrusted) handler(event);
+    }, options);
+
+    const panels = (filter = '') => document.querySelectorAll(`.translator-panel${filter}`);
+    // 窗口尺寸/滚动时需要重新约束的面板（排除拖动中与词表）
+    const floatingPanels = () => panels(':not(.dragging):not(.popdict-wordbook-panel)');
+
     // 配置项
     const CONFIG = {
+        enableCambridge: false, // 暂停自动查询，保留模块和手动词典入口
         fontSize: 17, // 基础字体大小（beta 整体增加 1px）
         sourceFontSize: 15, // 原文字体大小
         translationFontSize: 14, // 翻译结果字体大小
@@ -54,54 +73,41 @@
         maxCacheSize: 100, // 最大缓存条目数
     };
 
-    // 翻译缓存系统
-    const translationCache = {
-        cache: new Map(),
-        generateKey: (text, translator) => `${translator}:${text}`,
-        get(text, translator) {
-            const key = this.generateKey(text, translator);
-            const item = this.cache.get(key);
-            if (!item || Date.now() - item.timestamp > CONFIG.cacheExpiration) {
-                item && this.cache.delete(key);
-                return null;
+    const ICONS = {external: '🔎', eraser: '🧹', lock: '🔒', unlock: '🔓', moon: '🌙', sun: '🔆', close: '❌', trash: '📤', audio: '🔊'};
+    const ALLOWED_HOSTS = ['translate.googleapis.com', 'dict.youdao.com', 'dictionary.cambridge.org'];
+
+    // 带过期时间的内存缓存（插入序淘汰）；词条缓存与"无词条"缓存共用。
+    const cacheKey = (translator, text) => `${translator}:${text}`;
+    const createExpiringCache = ttl => {
+        const store = new Map();
+        return {
+            get(key) {
+                const item = store.get(key);
+                if (item && item.expires > Date.now()) return item.value;
+                store.delete(key);
+                return undefined;
+            },
+            set(key, value) {
+                store.delete(key);
+                store.set(key, {value, expires: Date.now() + ttl});
+                if (store.size > CONFIG.maxCacheSize) store.delete(store.keys().next().value);
             }
-            return item.translation;
-        },
-        set(text, translator, translation) {
-            const key = this.generateKey(text, translator);
-            this.cache.delete(key);
-            this.cache.set(key, { translation, timestamp: Date.now() });
-            if (this.cache.size > CONFIG.maxCacheSize) this.cache.delete(this.cache.keys().next().value);
-        }
+        };
     };
+    const translationCache = createExpiringCache(CONFIG.cacheExpiration);
+    // 只接收解析器的明确无词条信号；不持久化，不记录网络/HTTP/解析异常。
+    const negativeCache = createExpiringCache(CONFIG.negativeCacheExpiration);
 
     class NoEntryError extends Error {
         constructor() { super('词典确认无有效词条'); this.name = 'NoEntryError'; }
     }
 
-    // 只接收解析器的明确无词条信号；不持久化，不记录网络/HTTP/解析异常。
-    const negativeCache = {
-        cache: new Map(),
-        has(text, translator) {
-            const key = translationCache.generateKey(text, translator);
-            const expires = this.cache.get(key);
-            if (expires > Date.now()) return true;
-            this.cache.delete(key);
-            return false;
-        },
-        set(text, translator) {
-            const key = translationCache.generateKey(text, translator);
-            this.cache.delete(key);
-            this.cache.set(key, Date.now() + CONFIG.negativeCacheExpiration);
-            if (this.cache.size > CONFIG.maxCacheSize) this.cache.delete(this.cache.keys().next().value);
-        }
-    };
     const dictionaryKey = text => text.trim().toLowerCase().replace(/’/g, "'").replace(/\s+/g, ' ');
 
     // 新建窗口前移除未固定的旧窗口，固定窗口保留。
     function cleanupPanels() {
         hideHoverPanel(true);
-        document.querySelectorAll('.translator-panel:not(.pinned)').forEach(utils.removePanel);
+        panels(':not(.pinned)').forEach(panel => utils.removePanel(panel));
     }
 
     // 使用 GM 请求音频数据并交给 Web Audio 播放，避免网页 CSP 拦截外部媒体。
@@ -145,43 +151,73 @@
         }
     };
 
-    // 统一 GET 请求；剑桥单独使用匿名请求避开异常 Cookie 状态。
+    // 默认匿名；仅剑桥词条查询显式允许浏览器正常 Cookie，不读取或复制 Cookie。
     const gmGet = (url, options = {}) => new Promise((resolve, reject) => {
+        const destination = new URL(url);
+        if (destination.protocol !== 'https:' || destination.username || destination.password
+            || !ALLOWED_HOSTS.includes(destination.hostname)) {
+            reject(new Error('已阻止非词典地址请求'));
+            return;
+        }
+        if (!CONFIG.enableCambridge && destination.hostname === 'dictionary.cambridge.org') {
+            reject(new Error('剑桥自动查询已关闭，请手动打开词典'));
+            return;
+        }
         GM_xmlhttpRequest({
             method: 'GET',
             url,
+            anonymous: true,
             ...options,
             timeout: CONFIG.requestTimeout,
-            onload: response => response.status >= 200 && response.status < 300
-                ? resolve(response) : reject(new Error(`HTTP ${response.status}`)),
+            onload: response => {
+                if (response.status >= 200 && response.status < 300) return resolve(response);
+                const message = destination.hostname === 'dictionary.cambridge.org' && response.status === 403
+                    ? '剑桥访问被拒绝（HTTP 403）。可点击 🔎 手动打开词典检查访问状态，或手动切换引擎；脚本不会自动重试。'
+                    : `HTTP ${response.status}`;
+                reject(new Error(message));
+            },
             onerror: () => reject(new Error('网络请求失败')),
             ontimeout: () => reject(new Error('请求超时')),
             onabort: () => reject(new Error('请求已取消'))
         });
     });
 
-    // 翻译器工厂函数
-    const createTranslator = (name, translateFn, dictionary = false) => ({
-        name,
-        isMissing: text => dictionary && negativeCache.has(dictionaryKey(text), name),
-        translate: async text => {
-            if (dictionary && negativeCache.has(dictionaryKey(text), name)) throw new NoEntryError();
-            const cached = translationCache.get(text, name);
-            if (cached) return cached;
-            try {
-                const result = await translateFn(text);
-                if (!result?.html) throw new Error('翻译结果为空');
-                translationCache.set(text, name, result);
-                return result;
-            } catch (error) {
-                if (dictionary && error instanceof NoEntryError) {
-                    negativeCache.set(dictionaryKey(text), name);
-                    throw error;
+    // 仅规范 Google 查询副本；选区 Range 与 bookmark 继续保留原文和偏移。
+    const normalizeGoogleText = text => text.replace(/\r\n?/g, '\n').trim()
+        .split(/\n[ \t]*\n(?:[ \t]*\n)*/)
+        .map(paragraph => paragraph.replace(/[ \t\n]+/g, ' ').trim()).filter(Boolean).join('\n\n');
+
+    // 翻译器统一规范查询与缓存键，面板和外链复用相同文本。
+    // enabled() 为 false 时直接返回 disabledResult，且发生在缓存之前，不触发查询或高亮。
+    const createTranslator = (name, translateFn, {dictionary = false, normalize = text => text,
+        enabled = () => true, disabledResult = null} = {}) => {
+        const missingKey = text => cacheKey(name, dictionaryKey(text));
+        const isMissing = text => dictionary && Boolean(negativeCache.get(missingKey(text)));
+        return {
+            name,
+            normalize,
+            isMissing: text => enabled() && isMissing(text),
+            translate: async text => {
+                if (!enabled()) return disabledResult;
+                text = normalize(text);
+                if (isMissing(text)) throw new NoEntryError();
+                const cached = translationCache.get(cacheKey(name, text));
+                if (cached) return cached;
+                try {
+                    const result = await translateFn(text);
+                    if (!result?.html) throw new Error('翻译结果为空');
+                    translationCache.set(cacheKey(name, text), result);
+                    return result;
+                } catch (error) {
+                    if (dictionary && error instanceof NoEntryError) {
+                        negativeCache.set(missingKey(text), true);
+                        throw error;
+                    }
+                    throw new Error(`${name}失败: ${error?.message || '请求失败'}`);
                 }
-                throw new Error(`${name}失败: ${error?.message || '请求失败'}`);
             }
-        }
-    });
+        };
+    };
 
     const createPronHtml = (type, pron, url) => `<span class="phonetic-item">${utils.escapeHtml(type)} ${utils.escapeHtml(pron)}${url ? ` <button class="audio-button" data-url="${utils.escapeHtml(url)}">${ICONS.audio}</button>` : ''}</span>`;
 
@@ -256,8 +292,8 @@
             const response = await gmGet(`https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-CN&dt=t&q=${encodeURIComponent(text)}`);
             const result = JSON.parse(response.responseText);
             if (!result?.[0]?.length) throw new Error('谷歌翻译返回的数据格式不正确');
-            return { html: result[0].map(x => x[0]).join(''), highlightable: false };
-        }),
+            return { html: utils.escapeHtml(result[0].map(x => x[0]).join('')), highlightable: false };
+        }, {normalize: normalizeGoogleText}),
 
         youdao: createTranslator('有道词典', async (text) => {
             const response = await gmGet(
@@ -266,7 +302,6 @@
             );
 
             const result = JSON.parse(response.responseText);
-            let translation = '';
             if (result.error || (result.errorCode && String(result.errorCode) !== '0')) throw new Error('词典接口返回错误');
             if (result.query && dictionaryKey(result.query) !== dictionaryKey(text)) throw new Error('词典返回的查询词不匹配');
             const wordInfo = result.ec?.word?.[0];
@@ -276,41 +311,34 @@
             const exactEntry = !headword || (Array.isArray(headword) ? headword : [headword])
                 .some(value => dictionaryKey(value) === dictionaryKey(text));
             if (Array.isArray(result.ec?.word) && !result.ec.word.length) throw new NoEntryError();
-            const audioUrls = {
-                uk: wordInfo?.ukspeech ? `https://dict.youdao.com/dictvoice?audio=${wordInfo.ukspeech}` : '',
-                us: wordInfo?.usspeech ? `https://dict.youdao.com/dictvoice?audio=${wordInfo.usspeech}` : ''
-            };
-
-            // 添加音标和发音按钮
-            if (wordInfo?.ukphone || wordInfo?.usphone) {
-                translation += '<div class="phonetic-buttons">';
-                if (wordInfo.ukphone && audioUrls.uk) translation += createPronHtml('英', `/${wordInfo.ukphone}/`, audioUrls.uk);
-                if (wordInfo.usphone && audioUrls.us) translation += createPronHtml('美', `/${wordInfo.usphone}/`, audioUrls.us);
-                translation += '</div>\n\n';
-            }
+            // 音标 + 发音按钮
+            const pronunciations = [['英', wordInfo?.ukphone, wordInfo?.ukspeech], ['美', wordInfo?.usphone, wordInfo?.usspeech]]
+                .filter(([, phone, speech]) => phone && speech)
+                .map(([type, phone, speech]) => createPronHtml(type, `/${phone}/`, `https://dict.youdao.com/dictvoice?audio=${speech}`));
+            let translation = pronunciations.length ? `<div class="phonetic-buttons">${pronunciations.join('')}</div>\n\n` : '';
 
             // 获取翻译结果
             if (definitions.length) {
                 translation += definitions.map(utils.escapeHtml).join('; ');
             } else if (result.fanyi) {
-                translation = result.fanyi.tran;
+                translation = utils.escapeHtml(result.fanyi.tran);
             } else if (result.translation) {
-                translation = result.translation.join('\n');
+                translation = utils.escapeHtml(result.translation.join('\n'));
             } else if (result.web_trans?.web_translation) {
-                translation = result.web_trans.web_translation
+                translation = utils.escapeHtml(result.web_trans.web_translation
                     .map(item => item.trans.map(t => t.value).join('; '))
-                    .join('\n');
+                    .join('\n'));
             }
 
             if (!translation) throw new Error('未找到翻译结果');
             return {html: translation, highlightable: definitions.length > 0, dictionaryEntry: definitions.length > 0 && exactEntry};
-        }, true),
+        }, {dictionary: true}),
 
         cambridge: createTranslator('剑桥词典', async (text) => {
             const response = await gmGet(
                 `https://dictionary.cambridge.org/search/english-chinese-simplified/direct/?q=${encodeURIComponent(text)}`,
                 {
-                    anonymous: true,
+                    anonymous: false,
                     headers: {
                         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                         'Accept-Language': 'en-US,en;q=0.5'
@@ -327,21 +355,26 @@
             const dictionaryEntry = parsed.entries.some(entry => dictionaryKey(entry.headword) === dictionaryKey(text)
                 && entry.senses.some(sense => sense.definition || sense.translation));
             return {html, highlightable: true, dictionaryEntry};
-        }, true)
+        }, {
+            dictionary: true,
+            enabled: () => CONFIG.enableCambridge, // 暂停自动查询，保留模块和手动词典入口
+            disabledResult: {
+                html: '<div>⚠ 当前暂不支持自动查询</div><button type="button" class="cambridge-open">🔎 在剑桥词典中打开</button>',
+                highlightable: false
+            }
+        })
     };
 
     const EXTERNAL_URLS = {
         google: 'https://translate.google.com/?sl=auto&tl=zh-CN&text=',
         youdao: 'https://dict.youdao.com/w/',
-        cambridge: 'https://dictionary.cambridge.org/dictionary/english-chinese-simplified/'
+        cambridge: 'https://dictionary.cambridge.org/search/english-chinese-simplified/direct/?q='
     };
 
-    const ICONS = {external: '🔎', eraser: '🧹', lock: '🔒', unlock: '🔓', moon: '🌙', sun: '🔆', close: '❌', trash: '📤', audio: '🔊'};
-
-    // 添加样式
-    GM_addStyle(`
-        /* 主题变量与面板基础 */
-        .translator-panel {
+    // 样式约定：`&` 即 .translator-panel；PANEL_CSS 中的声明统一追加 !important 以压过宿主页面样式。
+    // 不能加 !important 的内容（主题变量、display:none 须可被行内样式覆盖、all:revert、动画、高亮）放在 SOFT_CSS。
+    const SOFT_CSS = `
+        & {
             --panel-bg: #fff;
             --panel-text: #000;
             --panel-border: #e2e8f0;
@@ -361,32 +394,10 @@
             --font-xs: 11px;
             --font-sm: 13px;
             --font-lg: 15px;
-            --theme-transition: background-color 0.15s ease-out,
-                                color 0.15s ease-out,
-                                border-color 0.15s ease-out;
-
-            position: absolute !important;
-            z-index: 2147483647 !important;
+            --theme-transition: background-color 0.15s ease-out, color 0.15s ease-out, border-color 0.15s ease-out;
             display: none;
-            flex-direction: column !important;
-            box-sizing: border-box !important;
-            max-width: ${CONFIG.panelWidth}px !important;
-            max-height: calc(100vh - ${CONFIG.panelSpacing * 2}px) !important;
-            overflow: hidden !important;
-            padding: var(--spacing-md) !important;
-            border: 1px solid var(--panel-border) !important;
-            border-radius: 6px !important;
-            background: var(--panel-bg) !important;
-            box-shadow: 0 4px 12px var(--panel-shadow) !important;
-            color: var(--panel-text) !important;
-            font-size: ${CONFIG.fontSize}px !important;
-            line-height: 1.5 !important;
-            opacity: 0 !important;
-            transform: none !important;
-            transition: var(--theme-transition), opacity ${CONFIG.animationDuration}ms ease-out !important;
         }
-
-        .translator-panel.translator-panel-dark {
+        &.translator-panel-dark {
             --panel-bg: #1a1a1a;
             --panel-text: #e0e0e0;
             --panel-border: #333;
@@ -399,592 +410,428 @@
             --active-link: #4a9eff;
             --error: #ff7875;
         }
-
+        & * { all: revert; }
+        @keyframes popdict-loading { from { transform: translateX(-110%); } to { transform: translateX(290%); } }
+        ::highlight(popdict-words) { background-color: rgba(245, 158, 11, 0.22); text-decoration: underline rgba(217, 119, 6, 0.7); }
+        ::highlight(popdict-hover) { background-color: rgba(245, 158, 11, 0.38); }
+        ::highlight(popdict-jump) { background-color: rgba(59, 130, 246, 0.3); }
+    `;
+    const PANEL_CSS = `
+        /* 主题变量与面板基础 */
+        & {
+            position: absolute;
+            z-index: 2147483647;
+            flex-direction: column;
+            box-sizing: border-box;
+            max-width: min(${CONFIG.panelWidth}px, calc(100vw - ${CONFIG.panelSpacing * 2}px));
+            max-height: calc(100vh - ${CONFIG.panelSpacing * 2}px);
+            overflow: hidden;
+            padding: var(--spacing-md);
+            border: 1px solid var(--panel-border);
+            border-radius: 6px;
+            background: var(--panel-bg);
+            box-shadow: 0 4px 12px var(--panel-shadow);
+            color: var(--panel-text);
+            font-size: ${CONFIG.fontSize}px;
+            line-height: 1.5;
+            opacity: 0;
+            transform: none;
+            transition: var(--theme-transition), opacity ${CONFIG.animationDuration}ms ease-out;
+        }
         /* 隔离宿主网页样式；必须放在组件规则之前 */
-        .translator-panel * {
-            all: revert;
-            box-sizing: border-box !important;
-            margin: 0 !important;
-            padding: 0 !important;
-            color: inherit !important;
-            font-family: inherit !important;
-            font-size: inherit !important;
-            line-height: inherit !important;
-            pointer-events: auto !important;
+        & * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            color: inherit;
+            font-family: inherit;
+            font-size: inherit;
+            line-height: inherit;
+            pointer-events: auto;
         }
-
-        .translator-panel.show {
-            opacity: 1 !important;
+        &.show { opacity: 1; }
+        &:has(.source-preview) { width: 460px; max-width: calc(100vw - ${CONFIG.panelSpacing * 2}px); }
+        & .cambridge-open {
+            display: inline-block;
+            margin-top: var(--spacing-lg);
+            padding: 4px 8px;
+            font-size: 12px;
+            line-height: 1.4;
+            border: 1px solid var(--panel-border);
+            border-radius: 6px;
+            background: var(--hover-bg);
+            cursor: pointer;
         }
-
-        .translator-panel.dropdown-open {
-            overflow: visible !important;
+        & .cambridge-open:hover { background: var(--title-hover-bg); }
+        & .cambridge-open:focus-visible, & .source-preview summary:focus-visible {
+            outline: 2px solid var(--active-link);
         }
-
-        .translator-panel.dragging {
-            cursor: move !important;
-            opacity: 0.95 !important;
-            pointer-events: none !important;
-            transition: none !important;
-        }
-
+        &.dropdown-open { overflow: visible; }
+        &.dragging { cursor: move; opacity: 0.95; pointer-events: none; transition: none; }
         /* 标题栏与翻译器切换 */
-        .translator-panel .title-bar {
-            position: relative !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: flex-start !important;
-            gap: var(--spacing-md) !important;
-            min-width: 0 !important;
-            margin: calc(-1 * var(--spacing-md)) calc(-1 * var(--spacing-md)) var(--spacing-md) !important;
-            padding: var(--spacing-xs) var(--spacing-md) !important;
-            border-bottom: 1px solid var(--panel-border) !important;
-            border-radius: 6px 6px 0 0 !important;
-            background: var(--title-bg) !important;
-            flex: 0 0 auto !important;
-            cursor: move !important;
-            user-select: none !important;
-            transition: var(--theme-transition) !important;
+        & .title-bar {
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: flex-start;
+            gap: var(--spacing-md);
+            min-width: 0;
+            margin: calc(-1 * var(--spacing-md)) calc(-1 * var(--spacing-md)) var(--spacing-md);
+            padding: var(--spacing-xs) var(--spacing-md);
+            border-bottom: 1px solid var(--panel-border);
+            border-radius: 6px 6px 0 0;
+            background: var(--title-bg);
+            flex: 0 0 auto;
+            cursor: move;
+            user-select: none;
+            transition: var(--theme-transition);
         }
-
-        .translator-panel .title-wrapper {
-            position: relative !important;
-            display: inline-flex !important;
-            align-items: center !important;
-            flex: 0 0 auto !important;
-            width: max-content !important;
-            gap: var(--spacing-sm) !important;
-            margin-right: auto !important;
-            padding: var(--spacing-xs) var(--spacing-lg) !important;
-            border: 0 !important;
-            border-radius: var(--spacing-sm) !important;
-            background: transparent !important;
-            cursor: pointer !important;
-            transition: background-color 0.2s !important;
+        & .title-wrapper {
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+            flex: 0 0 auto;
+            width: max-content;
+            gap: var(--spacing-sm);
+            margin-right: auto;
+            padding: var(--spacing-xs) var(--spacing-lg);
+            border: 0;
+            border-radius: var(--spacing-sm);
+            background: transparent;
+            cursor: pointer;
+            transition: background-color 0.2s;
         }
-
-        .translator-panel .title-wrapper:hover,
-        .translator-panel .title-wrapper.open {
-            background: var(--title-hover-bg) !important;
+        & .title-wrapper:hover, & .title-wrapper.open { background: var(--title-hover-bg); }
+        & .title, & .switch-text {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-size: var(--font-sm);
         }
-
-        .translator-panel .title,
-        .translator-panel .switch-text {
-            overflow: hidden !important;
-            text-overflow: ellipsis !important;
-            white-space: nowrap !important;
-            font-size: var(--font-sm) !important;
-        }
-
-        .translator-panel .title {
-            color: var(--panel-text) !important;
-            font-weight: 500 !important;
-        }
-
-        .translator-panel .switch-text {
-            color: var(--text-tertiary) !important;
-            opacity: 0.8 !important;
-        }
-
+        & .title { color: var(--panel-text); font-weight: 500; }
+        & .switch-text { color: var(--text-tertiary); opacity: 0.8; }
         /* 标题栏图标按钮 */
-        .translator-panel .icon-button {
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-            flex: 0 0 18px !important;
-            width: 18px !important;
-            height: 18px !important;
-            padding: 0 !important;
-            border: 0 !important;
-            border-radius: 3px !important;
-            background: transparent !important;
-            color: var(--panel-text) !important;
-            cursor: pointer !important;
-            opacity: 0.82 !important;
-            font: 15px/1 "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif !important;
-            transition: background-color 0.15s, opacity 0.15s !important;
+        & .icon-button {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex: 0 0 18px;
+            width: 18px;
+            height: 18px;
+            padding: 0;
+            border: 0;
+            border-radius: 3px;
+            background: transparent;
+            color: var(--panel-text);
+            cursor: pointer;
+            opacity: 0.82;
+            font: 15px/1 "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif;
+            transition: background-color 0.15s, opacity 0.15s;
         }
-
-        .translator-panel .icon-button:hover {
-            background: var(--title-hover-bg) !important;
-            opacity: 1 !important;
-        }
-
-        .translator-panel .pin-button.pinned {
-            opacity: 1 !important;
-        }
-
-        .translator-panel .unhighlight-button[hidden] {
-            display: none !important;
-        }
-
+        & .icon-button:hover { background: var(--title-hover-bg); opacity: 1; }
+        & .pin-button.pinned { opacity: 1; }
+        & .unhighlight-button[hidden] { display: none; }
         /* 翻译器下拉菜单 */
-        .translator-panel .dropdown-menu {
-            position: absolute !important;
-            top: calc(100% + 4px) !important;
-            left: 0 !important;
-            z-index: 2147483647 !important;
-            min-width: 150px !important;
-            max-height: 300px !important;
-            overflow-y: auto !important;
-            border: 1px solid var(--panel-border) !important;
-            border-radius: 6px !important;
-            background: var(--panel-bg) !important;
-            box-shadow: 0 2px 8px var(--panel-shadow) !important;
-            opacity: 0 !important;
-            visibility: hidden !important;
-            transform: scale(0.95) !important;
-            transform-origin: top left !important;
-            transition: opacity 0.15s ease-out, transform 0.15s ease-out, visibility 0.15s !important;
+        & .dropdown-menu {
+            position: absolute;
+            top: calc(100% + 4px);
+            left: 0;
+            z-index: 2147483647;
+            min-width: 150px;
+            max-height: 300px;
+            overflow-y: auto;
+            border: 1px solid var(--panel-border);
+            border-radius: 6px;
+            background: var(--panel-bg);
+            box-shadow: 0 2px 8px var(--panel-shadow);
+            opacity: 0;
+            visibility: hidden;
+            transform: scale(0.95);
+            transform-origin: top left;
+            transition: opacity 0.15s ease-out, transform 0.15s ease-out, visibility 0.15s;
         }
-
-        .translator-panel .dropdown-menu.open-upward {
-            top: auto !important;
-            bottom: calc(100% + 4px) !important;
-            transform-origin: bottom left !important;
+        & .dropdown-menu.open-upward { top: auto; bottom: calc(100% + 4px); transform-origin: bottom left; }
+        & .dropdown-menu.align-right { right: 0; left: auto; }
+        & .dropdown-menu.show { visibility: visible; opacity: 1; transform: scale(1); }
+        & .dropdown-menu::before, & .dropdown-menu::after, & .title-wrapper::before, & .title-wrapper::after, & .title-bar::before, & .title-bar::after {
+            content: none;
+            display: none;
         }
-
-        .translator-panel .dropdown-menu.align-right {
-            right: 0 !important;
-            left: auto !important;
+        & .dropdown-item {
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: var(--spacing-md) var(--spacing-xl);
+            color: var(--panel-text);
+            font-size: var(--font-sm);
+            white-space: nowrap;
+            cursor: pointer;
         }
-
-        .translator-panel .dropdown-menu.show {
-            visibility: visible !important;
-            opacity: 1 !important;
-            transform: scale(1) !important;
+        & .dropdown-item:hover { background: var(--hover-bg); }
+        & .translator-name { display: flex; align-items: center; gap: var(--spacing-sm); }
+        & .dropdown-item.active .translator-name { font-weight: 600; }
+        & .dropdown-item.is-default .translator-name::after {
+            content: '默认';
+            margin-left: var(--spacing-sm);
+            padding: 2px 4px;
+            border-radius: 3px;
+            background: var(--text-tertiary);
+            color: var(--panel-bg);
+            font-size: var(--font-xs);
+            font-weight: 400;
+            opacity: 0.8;
         }
-
-        .translator-panel .dropdown-menu::before,
-        .translator-panel .dropdown-menu::after,
-        .translator-panel .title-wrapper::before,
-        .translator-panel .title-wrapper::after,
-        .translator-panel .title-bar::before,
-        .translator-panel .title-bar::after {
-            content: none !important;
-            display: none !important;
+        & .set-default {
+            padding: var(--spacing-xs) var(--spacing-sm);
+            border-radius: var(--spacing-xs);
+            color: var(--text-tertiary);
+            font-size: var(--font-xs);
+            opacity: 0;
+            transition: color 0.2s, background-color 0.2s, opacity 0.2s;
         }
-
-        .translator-panel .dropdown-item {
-            position: relative !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: space-between !important;
-            padding: var(--spacing-md) var(--spacing-xl) !important;
-            color: var(--panel-text) !important;
-            font-size: var(--font-sm) !important;
-            white-space: nowrap !important;
-            cursor: pointer !important;
-        }
-
-        .translator-panel .dropdown-item:hover {
-            background: var(--hover-bg) !important;
-        }
-
-        .translator-panel .translator-name {
-            display: flex !important;
-            align-items: center !important;
-            gap: var(--spacing-sm) !important;
-        }
-
-        .translator-panel .dropdown-item.active .translator-name {
-            font-weight: 600 !important;
-        }
-
-        .translator-panel .dropdown-item.is-default .translator-name::after {
-            content: '默认' !important;
-            margin-left: var(--spacing-sm) !important;
-            padding: 2px 4px !important;
-            border-radius: 3px !important;
-            background: var(--text-tertiary) !important;
-            color: var(--panel-bg) !important;
-            font-size: var(--font-xs) !important;
-            font-weight: 400 !important;
-            opacity: 0.8 !important;
-        }
-
-        .translator-panel .set-default {
-            padding: var(--spacing-xs) var(--spacing-sm) !important;
-            border-radius: var(--spacing-xs) !important;
-            color: var(--text-tertiary) !important;
-            font-size: var(--font-xs) !important;
-            opacity: 0 !important;
-            transition: color 0.2s, background-color 0.2s, opacity 0.2s !important;
-        }
-
-        .translator-panel .dropdown-item:hover .set-default {
-            opacity: 1 !important;
-        }
-
-        .translator-panel .set-default:hover {
-            background: var(--hover-bg) !important;
-            color: var(--active-link) !important;
-        }
-
-        .translator-panel .dropdown-item.is-default .set-default {
-            display: none !important;
-        }
-
+        & .dropdown-item:hover .set-default { opacity: 1; }
+        & .set-default:hover { background: var(--hover-bg); color: var(--active-link); }
+        & .dropdown-item.is-default .set-default { display: none; }
         /* 加载状态与网页高亮 */
-        .translator-panel .loading-bar {
-            position: absolute !important;
-            top: 27px !important;
-            left: 0 !important;
-            right: 0 !important;
-            height: 2px !important;
-            overflow: hidden !important;
-            opacity: 0 !important;
-            pointer-events: none !important;
+        & .loading-bar {
+            position: absolute;
+            top: 27px;
+            left: 0;
+            right: 0;
+            height: 2px;
+            overflow: hidden;
+            opacity: 0;
+            pointer-events: none;
         }
-
-        .translator-panel.loading .loading-bar {
-            opacity: 1 !important;
+        &.loading .loading-bar { opacity: 1; }
+        & .loading-bar::after {
+            content: '';
+            display: block;
+            width: 38%;
+            height: 100%;
+            background: var(--active-link);
+            animation: popdict-loading 0.9s ease-in-out infinite;
         }
-
-        .translator-panel .loading-bar::after {
-            content: '' !important;
-            display: block !important;
-            width: 38% !important;
-            height: 100% !important;
-            background: var(--active-link) !important;
-            animation: popdict-loading 0.9s ease-in-out infinite !important;
-        }
-
-        @keyframes popdict-loading {
-            from { transform: translateX(-110%); }
-            to { transform: translateX(290%); }
-        }
-
-        ::highlight(popdict-words) {
-            background-color: rgba(245, 158, 11, 0.22);
-            text-decoration: underline rgba(217, 119, 6, 0.7);
-        }
-
-        ::highlight(popdict-hover) {
-            background-color: rgba(245, 158, 11, 0.38);
-        }
-
-        ::highlight(popdict-jump) {
-            background-color: rgba(59, 130, 246, 0.3);
-        }
-
         /* 页面高亮词汇 */
         .popdict-wordbook-button {
-            position: fixed !important;
-            right: 18px !important;
-            bottom: 18px !important;
-            z-index: 2147483646 !important;
-            min-width: 52px !important;
-            height: 34px !important;
-            padding: 0 12px !important;
-            border: 1px solid #d1d5db !important;
-            border-radius: 17px !important;
-            background: #fff !important;
-            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12) !important;
-            color: #111 !important;
-            font: 500 14px/1 sans-serif !important;
-            cursor: pointer !important;
+            position: fixed;
+            right: 18px;
+            bottom: 18px;
+            z-index: 2147483646;
+            min-width: 52px;
+            height: 34px;
+            padding: 0 12px;
+            border: 1px solid #d1d5db;
+            border-radius: 17px;
+            background: #fff;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+            color: #111;
+            font: 500 14px/1 sans-serif;
+            cursor: pointer;
         }
-
-        .popdict-wordbook-button:hover { background: #f1f5f9 !important; }
-        .popdict-wordbook-button.dark {
-            border-color: #333 !important;
-            background: #1a1a1a !important;
-            color: #e0e0e0 !important;
+        .popdict-wordbook-button:hover { background: #f1f5f9; }
+        .popdict-wordbook-button.dark { border-color: #333; background: #1a1a1a; color: #e0e0e0; }
+        .popdict-wordbook-button.dark:hover { background: #2c2c2c; }
+        &.popdict-wordbook-panel {
+            position: fixed;
+            right: 18px;
+            bottom: 62px;
+            left: auto;
+            top: auto;
+            display: flex;
+            width: max-content;
+            min-width: 210px;
+            max-width: min(340px, calc(100vw - 24px));
+            max-height: min(60vh, 420px);
+            opacity: 1;
+            transform: none;
         }
-        .popdict-wordbook-button.dark:hover { background: #2c2c2c !important; }
-
-        .translator-panel.popdict-wordbook-panel {
-            position: fixed !important;
-            right: 18px !important;
-            bottom: 62px !important;
-            left: auto !important;
-            top: auto !important;
-            display: flex !important;
-            width: max-content !important;
-            min-width: 210px !important;
-            max-width: min(340px, calc(100vw - 24px)) !important;
-            max-height: min(60vh, 420px) !important;
-            opacity: 1 !important;
-            transform: none !important;
-        }
-
-        .popdict-wordbook-panel .title-bar {
-            margin-bottom: 0 !important;
-            cursor: default !important;
-        }
-
-        .popdict-wordbook-panel .wordbook-title { margin-right: auto !important; }
+        .popdict-wordbook-panel .title-bar { margin-bottom: 0; cursor: default; }
+        .popdict-wordbook-panel .wordbook-title { margin-right: auto; }
         .popdict-wordbook-panel .wordbook-export {
-            border: 0 !important;
-            background: transparent !important;
-            color: var(--panel-text) !important;
-            font-size: var(--font-sm) !important;
-            cursor: pointer !important;
-            opacity: 0.68 !important;
+            border: 0;
+            background: transparent;
+            color: var(--panel-text);
+            font-size: var(--font-sm);
+            cursor: pointer;
+            opacity: 0.68;
         }
-        .popdict-wordbook-panel .wordbook-export:hover { opacity: 1 !important; }
-        .popdict-wordbook-panel .wordbook-list { padding: 3px !important; }
+        .popdict-wordbook-panel .wordbook-export:hover { opacity: 1; }
+        .popdict-wordbook-panel .wordbook-list { padding: 3px; }
         .popdict-wordbook-panel .wordbook-item {
-            gap: var(--spacing-sm) !important;
-            padding: 3px 6px !important;
-            border-radius: var(--spacing-sm) !important;
-            font-size: 15px !important;
-            line-height: 1.25 !important;
+            gap: var(--spacing-sm);
+            padding: 3px 6px;
+            border-radius: var(--spacing-sm);
+            font-size: 15px;
+            line-height: 1.25;
         }
         .popdict-wordbook-panel .wordbook-word {
-            flex: 1 1 auto !important;
-            min-width: 0 !important;
-            overflow: hidden !important;
-            text-overflow: ellipsis !important;
-            white-space: nowrap !important;
+            flex: 1 1 auto;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
         .popdict-wordbook-panel .wordbook-count {
-            flex: 0 0 auto !important;
-            color: var(--text-tertiary) !important;
-            font-size: var(--font-sm) !important;
+            flex: 0 0 auto;
+            color: var(--text-tertiary);
+            font-size: var(--font-sm);
         }
-        .popdict-wordbook-panel .wordbook-remove {
-            color: var(--panel-text) !important;
-            opacity: 0 !important;
-            visibility: hidden !important;
+        .popdict-wordbook-panel .wordbook-remove { color: var(--panel-text); opacity: 0; visibility: hidden; }
+        .popdict-wordbook-panel .wordbook-item:hover .wordbook-remove, .popdict-wordbook-panel .wordbook-remove:focus-visible {
+            opacity: 1;
+            visibility: visible;
         }
-        .popdict-wordbook-panel .wordbook-item:hover .wordbook-remove,
-        .popdict-wordbook-panel .wordbook-remove:focus-visible {
-            opacity: 1 !important;
-            visibility: visible !important;
-        }
-
         /* 翻译内容 */
-        .translator-panel .content {
-            position: relative !important;
-            display: flex !important;
-            flex: 1 1 auto !important;
-            flex-direction: column !important;
-            min-height: 0 !important;
-            height: auto !important;
-            max-height: none !important;
-            overflow: hidden !important;
+        & .content {
+            position: relative;
+            display: flex;
+            flex: 1 1 auto;
+            flex-direction: column;
+            min-height: 0;
+            overflow: hidden;
         }
-
-        .translator-panel .source-text {
-            flex: 0 0 auto !important;
-            overflow: visible !important;
-            margin: calc(-1 * var(--spacing-md)) calc(-1 * var(--spacing-md)) 0 !important;
-            padding: var(--spacing-md) var(--spacing-lg) var(--spacing-md) calc(var(--spacing-lg) + var(--spacing-sm)) !important;
-            border-bottom: 1px solid var(--panel-border) !important;
-            background: var(--panel-bg) !important;
-            transition: var(--theme-transition) !important;
-            color: var(--panel-text) !important;
-            font-size: ${CONFIG.sourceFontSize}px !important;
-            font-weight: 600 !important;
-            white-space: pre-wrap !important;
-            user-select: text !important;
+        & .source-text {
+            flex: 0 0 auto;
+            padding: var(--spacing-md);
+            border-bottom: 1px solid var(--panel-border);
+            background: var(--panel-bg);
+            transition: var(--theme-transition);
+            color: var(--panel-text);
+            font-size: ${CONFIG.sourceFontSize}px;
+            font-weight: 600;
+            white-space: pre-wrap;
+            user-select: text;
         }
-
-        .translator-panel .source-text,
-        .translator-panel .translation,
-        .translator-panel .def-content {
-            overflow-wrap: anywhere !important;
+        & .source-text, & .translation, & .def-content { overflow-wrap: anywhere; }
+        & .translation-container { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: var(--spacing-md); }
+        & .translation {
+            max-width: 100%;
+            color: var(--panel-text);
+            font-size: ${CONFIG.translationFontSize}px;
+            white-space: normal;
+            user-select: text;
         }
-
-        .translator-panel .translation-container {
-            display: block !important;
-            flex: 1 1 auto !important;
-            min-height: 0 !important;
-            max-height: none !important;
-            overflow-y: auto !important;
-            padding: var(--spacing-md) !important;
+        & .translation-prose, & .source-prose {
+            white-space: normal;
+            font-size: ${CONFIG.translationFontSize}px;
+            line-height: 1.55;
         }
-
-        .translator-panel .translation {
-            max-width: 100% !important;
-            overflow: visible !important;
-            color: var(--panel-text) !important;
-            font-size: ${CONFIG.translationFontSize}px !important;
-            white-space: normal !important;
-            user-select: text !important;
+        & .translation-prose p + p, & .source-prose p + p { margin-top: .5em; }
+        & .source-preview { margin-bottom: var(--spacing-lg); border-bottom: 1px solid var(--panel-border); }
+        & .source-preview summary {
+            display: list-item;
+            padding: var(--spacing-sm) 0;
+            font-size: 12px;
+            line-height: 1.4;
+            color: var(--text-secondary);
+            cursor: pointer;
         }
-
-        .translator-panel .error {
-            padding: var(--spacing-xl) 0 !important;
-            color: var(--error) !important;
-            font-size: var(--font-sm) !important;
-            text-align: center !important;
+        & .source-preview .source-text {
+            padding: var(--spacing-sm) 0 var(--spacing-lg);
+            border: 0;
+            font-weight: 400;
         }
-
+        & .error { padding: var(--spacing-xl) 0; color: var(--error); font-size: var(--font-sm); text-align: center; }
         /* 词典释义组件 */
-        .translator-panel .phonetic-buttons,
-        .translator-panel .sense-phonetic {
-            display: flex !important;
-            flex-wrap: wrap !important;
+        & .phonetic-buttons, & .sense-phonetic { display: flex; flex-wrap: wrap; }
+        & .phonetic-buttons { gap: var(--spacing-xl); margin-bottom: var(--spacing-sm); }
+        & .phonetic-item {
+            display: flex;
+            align-items: center;
+            gap: var(--spacing-xs);
+            padding: var(--spacing-xs) var(--spacing-sm);
+            color: var(--text-secondary);
+            font-size: 12px;
+            line-height: 1.3;
+            white-space: nowrap;
+            user-select: text;
         }
-
-        .translator-panel .phonetic-buttons {
-            gap: var(--spacing-xl) !important;
-            margin-bottom: var(--spacing-sm) !important;
+        & .audio-button {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: var(--spacing-xs) var(--spacing-sm);
+            border: 0;
+            border-radius: var(--spacing-xs);
+            background: transparent;
+            color: var(--active-link);
+            font: var(--font-lg)/1 "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif;
+            cursor: pointer;
+            opacity: 0.82;
+            transition: background-color 0.15s, opacity 0.15s, transform 0.2s;
         }
-
-        .translator-panel .phonetic-item {
-            display: flex !important;
-            align-items: center !important;
-            gap: var(--spacing-xs) !important;
-            padding: var(--spacing-xs) var(--spacing-sm) !important;
-            color: var(--text-secondary) !important;
-            white-space: nowrap !important;
-            user-select: text !important;
+        & .audio-button:hover { background: var(--hover-bg); opacity: 1; }
+        & .audio-button:active { transform: scale(0.95); }
+        & .sense-block {
+            display: flex;
+            align-items: flex-start;
+            gap: var(--spacing-md);
+            margin: var(--spacing-xs) 0;
+            padding: var(--spacing-xs) 0;
+            border-bottom: 1px solid var(--panel-border);
+            transition: var(--theme-transition);
         }
-
-        .translator-panel .audio-button {
-            display: inline-flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-            padding: var(--spacing-xs) var(--spacing-sm) !important;
-            border: 0 !important;
-            border-radius: var(--spacing-xs) !important;
-            background: transparent !important;
-            color: var(--active-link) !important;
-            font: var(--font-lg)/1 "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif !important;
-            cursor: pointer !important;
-            opacity: 0.82 !important;
-            transition: background-color 0.15s, opacity 0.15s, transform 0.2s !important;
+        & .sense-block:first-child { margin-top: 0; }
+        & .sense-block:last-child { margin-bottom: 0; border-bottom: 0; }
+        & .pos-tags {
+            display: flex;
+            flex-direction: column;
+            flex-shrink: 0;
+            align-items: center;
+            min-width: 35px;
+            gap: var(--spacing-xs);
         }
-
-        .translator-panel .audio-button:hover {
-            background: var(--hover-bg) !important;
-            opacity: 1 !important;
+        & .pos-tag {
+            width: 100%;
+            padding: var(--spacing-xs) var(--spacing-sm);
+            border-radius: var(--spacing-xs);
+            background: #6b7280;
+            color: #fff;
+            font-size: 12px;
+            line-height: 1.3;
+            font-weight: 500;
+            text-align: center;
+            user-select: text;
         }
-
-        .translator-panel .audio-button:active {
-            transform: scale(0.95) !important;
+        & .level-tag {
+            min-width: 24px;
+            margin-top: var(--spacing-xs);
+            padding: var(--spacing-xs) var(--spacing-sm);
+            border-radius: 3px;
+            font-weight: 500;
+            letter-spacing: 0.5px;
+            text-align: center;
+            font-size: 11px;
+            line-height: 1.2;
+            background: var(--hover-bg);
         }
-
-        .translator-panel .sense-block {
-            display: flex !important;
-            align-items: flex-start !important;
-            gap: var(--spacing-md) !important;
-            margin: var(--spacing-xs) 0 !important;
-            padding: var(--spacing-xs) 0 !important;
-            border-bottom: 1px solid var(--panel-border) !important;
-            transition: var(--theme-transition) !important;
-        }
-
-        .translator-panel .sense-block:first-child {
-            margin-top: 0 !important;
-        }
-
-        .translator-panel .sense-block:last-child {
-            margin-bottom: 0 !important;
-            border-bottom: 0 !important;
-        }
-
-        .translator-panel .pos-tags {
-            display: flex !important;
-            flex-direction: column !important;
-            flex-shrink: 0 !important;
-            align-items: center !important;
-            min-width: 35px !important;
-            gap: var(--spacing-xs) !important;
-        }
-
-        .translator-panel .pos-tag {
-            width: 100% !important;
-            padding: var(--spacing-xs) var(--spacing-sm) !important;
-            border-radius: var(--spacing-xs) !important;
-            background: var(--pos-color, #6b7280) !important;
-            color: #fff !important;
-            font-weight: 500 !important;
-            text-align: center !important;
-            user-select: text !important;
-        }
-
-        .translator-panel .level-tag {
-            min-width: 24px !important;
-            margin-top: var(--spacing-xs) !important;
-            padding: var(--spacing-xs) var(--spacing-sm) !important;
-            border-radius: 3px !important;
-            font-weight: 500 !important;
-            letter-spacing: 0.5px !important;
-            text-align: center !important;
-        }
-
-        .translator-panel .def-content {
-            flex: 1 !important;
-            min-width: 0 !important;
-            overflow: visible !important;
-        }
-
-        .translator-panel .sense-phonetic {
-            gap: var(--spacing-md) !important;
-            margin-bottom: var(--spacing-xs) !important;
-            opacity: 0.8 !important;
-        }
-
-        .translator-panel .sense-phonetic .audio-button {
-            padding: var(--spacing-xs) !important;
-        }
-
+        & .def-content { flex: 1; min-width: 0; overflow: visible; }
+        & .sense-phonetic { gap: var(--spacing-md); margin-bottom: var(--spacing-xs); font-size: 12px; line-height: 1.3; opacity: 0.8; }
+        & .sense-phonetic .audio-button { padding: var(--spacing-xs); }
         /* 词典正文密度：共用组件，不为每个翻译器复制面板样式。 */
-        .translator-panel .def-text,
-        .translator-panel .phrase-text {
-            font-size: 13px !important;
-            line-height: 1.45 !important;
-        }
-        .translator-panel .trans-line {
-            font-size: 14px !important;
-            line-height: 1.45 !important;
-        }
-        .translator-panel .phrase-text { font-weight: 600 !important; }
-        .translator-panel .phonetic-item,
-        .translator-panel .sense-phonetic,
-        .translator-panel .sense-phonetic .phonetic-item,
-        .translator-panel .pos-tag {
-            font-size: 12px !important;
-            line-height: 1.3 !important;
-        }
-        .translator-panel .level-tag {
-            font-size: 11px !important;
-            line-height: 1.2 !important;
-            background: var(--hover-bg) !important;
-        }
-
+        & .def-text, & .phrase-text { font-size: 13px; line-height: 1.45; }
+        & .trans-line { font-size: 14px; line-height: 1.45; }
+        & .phrase-text { font-weight: 600; }
         /* 滚动条 */
-        .translator-panel .dropdown-menu::-webkit-scrollbar {
-            width: 3px !important;
-            height: 3px !important;
+        & .dropdown-menu::-webkit-scrollbar { width: 3px; height: 3px; }
+        & .translation-container::-webkit-scrollbar { width: 5px; height: 5px; }
+        & .dropdown-menu::-webkit-scrollbar-thumb, & .translation-container::-webkit-scrollbar-thumb {
+            border-radius: 4px;
+            background: var(--text-tertiary);
         }
-
-        .translator-panel .translation-container::-webkit-scrollbar {
-            width: 5px !important;
-            height: 5px !important;
+        & .dropdown-menu::-webkit-scrollbar-thumb:hover, & .translation-container::-webkit-scrollbar-thumb:hover {
+            background: var(--text-secondary);
         }
-
-        .translator-panel .dropdown-menu::-webkit-scrollbar-thumb,
-        .translator-panel .translation-container::-webkit-scrollbar-thumb {
-            border-radius: 4px !important;
-            background: var(--text-tertiary) !important;
-        }
-
-        .translator-panel .dropdown-menu::-webkit-scrollbar-thumb:hover,
-        .translator-panel .translation-container::-webkit-scrollbar-thumb:hover {
-            background: var(--text-secondary) !important;
-        }
-
-        .translator-panel .dropdown-menu::-webkit-scrollbar-track {
-            background: transparent !important;
-        }
-
-        .translator-panel .translation-container::-webkit-scrollbar-track {
-            border-radius: 4px !important;
-            background: var(--hover-bg) !important;
-        }
-        .translator-panel.closing,
-        .translator-panel.popdict-wordbook-panel.closing {
-            opacity: 0 !important;
-            pointer-events: none !important;
-        }
-        .translator-panel.closing * { pointer-events: none !important; }
-    `);
+        & .dropdown-menu::-webkit-scrollbar-track { background: transparent; }
+        & .translation-container::-webkit-scrollbar-track { border-radius: 4px; background: var(--hover-bg); }
+        /* 关闭动画 */
+        &.closing { opacity: 0; pointer-events: none; }
+        &.closing * { pointer-events: none; }
+    `;
+    const withImportant = css => css.replace(/([\w-]+\s*:[^;{}]+?)\s*;/g, '$1 !important;');
+    GM_addStyle((SOFT_CSS + withImportant(PANEL_CSS)).replace(/&/g, '.translator-panel'));
 
     // 仅保留跨窗口共享且确实需要的状态。
     const state = {
@@ -1037,7 +884,7 @@
         toggleDarkMode() {
             const isDark = !this.isDarkMode();
             GM_setValue('darkMode', isDark);
-            document.querySelectorAll('.translator-panel:not(.closing)').forEach(panel => {
+            panels(':not(.closing)').forEach(panel => {
                 panel.classList.toggle(CONFIG.darkModeClass, isDark);
                 updateThemeButton(panel.querySelector('.theme-button'), isDark);
             });
@@ -1122,9 +969,13 @@
             panel.addEventListener('transitionend', finish);
             panel.classList.add('closing');
         },
-        isEditableTarget: target => target instanceof Element && Boolean(
-            target.closest('input, textarea, select, option, [contenteditable]:not([contenteditable="false"])')
-        ),
+        hideUnpinned: () => panels(':not(.pinned)').forEach(panel => utils.hidePanel(panel)),
+        isEditableTarget: target => {
+            for (let node = target; node instanceof Element; node = node.getRootNode()?.host) {
+                if (node.isContentEditable || node.closest('input, textarea, select, option')) return true;
+            }
+            return false;
+        },
         isClickInPanel: e => e.target instanceof Element && Boolean(
             e.target.closest('.translator-panel, .popdict-wordbook-button')
         ),
@@ -1134,31 +985,45 @@
         }
     };
 
-    const buildContentHTML = (text, html) => `
-        <div class="source-text">${utils.escapeHtml(text)}</div>
-        <div class="translation-container"><div class="translation">${html}</div></div>`;
+    const buildContentHTML = (text, html, translatorKey) => {
+        // 输入已转义；空行分段，单换行按普通空白排版，不固定网页源码的断行。
+        const paragraphs = escaped => escaped.replace(/\r\n?/g, '\n').trim().split(/\n[ \t]*\n(?:[ \t]*\n)*/)
+            .filter(part => part.trim()).map(part => `<p>${part.trim()}</p>`).join('');
+        const prose = translatorKey === 'google';
+        const escaped = utils.escapeHtml(text);
+        const original = `<div class="source-text${prose ? ' source-prose' : ''}">${prose ? paragraphs(escaped) : escaped}</div>`;
+        const translation = `<div class="translation${prose ? ' translation-prose' : ''}">${prose ? paragraphs(html) : html}</div>`;
+        // 长文本共用一个滚动区域；原生 details 保留全文，无额外展开状态。
+        return translatorKey === 'google' && text.length > 160
+            ? `<div class="translation-container"><details class="source-preview"><summary>查看原文</summary>${original}</details>${translation}</div>`
+            : `${original}<div class="translation-container">${translation}</div>`;
+    };
 
     // 在原选区内截取英文部分，仅生成 Range，不改写原文节点。
     function sliceSelectionRange(selected, start, end) {
+        if (selected.startContainer === selected.endContainer && selected.startContainer.nodeType === Node.TEXT_NODE) {
+            const range = selected.cloneRange();
+            range.setStart(selected.startContainer, selected.startOffset + start);
+            range.setEnd(selected.startContainer, selected.startOffset + end);
+            return range;
+        }
         let container = selected.commonAncestorContainer;
         if (container.nodeType === Node.TEXT_NODE) container = container.parentElement;
         if (!container || container.closest?.('.translator-panel')) return null;
         const range = document.createRange();
-        range.selectNodeContents(container);
-        range.setEnd(selected.startContainer, selected.startOffset);
-        const prefixLength = range.toString().length;
-        start += prefixLength;
-        end += prefixLength;
         const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
         let node, offset = 0, started = false;
         while ((node = walker.nextNode())) {
-            const next = offset + node.data.length;
+            if (!selected.intersectsNode(node)) continue;
+            const from = node === selected.startContainer ? selected.startOffset : 0;
+            const to = node === selected.endContainer ? selected.endOffset : node.length;
+            const next = offset + to - from;
             if (!started && start < next) {
-                range.setStart(node, start - offset);
+                range.setStart(node, from + start - offset);
                 started = true;
             }
             if (started && end <= next) {
-                range.setEnd(node, end - offset);
+                range.setEnd(node, from + end - offset);
                 return range;
             }
             offset = next;
@@ -1295,7 +1160,7 @@
         document.body.appendChild(wordbookPanel);
         renderWordbook(groups);
 
-        wordbookPanel.addEventListener('click', e => {
+        on(wordbookPanel, 'click', e => {
             utils.stopEvent(e);
             if (e.target.closest('.wordbook-close')) {
                 closeWordbook();
@@ -1342,7 +1207,7 @@
             wordbookButton = document.createElement('button');
             wordbookButton.type = 'button';
             wordbookButton.className = 'popdict-wordbook-button';
-            wordbookButton.addEventListener('click', e => {
+            on(wordbookButton, 'click', e => {
                 utils.stopEvent(e);
                 toggleWordbook();
             });
@@ -1392,7 +1257,8 @@
         const range = bookmark.range.cloneRange();
         for (const oldRange of highlightStore.keys()) {
             if (!isHighlightValid(oldRange)
-                || (range.compareBoundaryPoints(Range.END_TO_START, oldRange) < 0
+                || (range.startContainer.getRootNode() === oldRange.startContainer.getRootNode()
+                    && range.compareBoundaryPoints(Range.END_TO_START, oldRange) < 0
                     && range.compareBoundaryPoints(Range.START_TO_END, oldRange) > 0)) {
                 removeHighlight(oldRange, false);
             }
@@ -1470,11 +1336,11 @@
         const rect = range.getBoundingClientRect();
         utils.showPanel(rect, panel);
         utils.removePanel(previous);
-        panel.addEventListener('mouseenter', () => {
+        on(panel, 'mouseenter', () => {
             cancelHoverTimers();
             utils.revivePanel(panel);
         });
-        panel.addEventListener('mouseleave', e => {
+        on(panel, 'mouseleave', e => {
             if (!panel.classList.contains('pinned')) updateHoverTarget(e.clientX, e.clientY, e.relatedTarget);
         });
     }
@@ -1520,11 +1386,11 @@
     async function translate(text, targetPanel) {
         if (!text || !targetPanel) throw new Error('翻译参数无效');
 
-        const textToTranslate = text.replace(/\n\s*\n/g, '\n\n').replace(/\s*\n\s*/g, '\n').trim();
-        if (!textToTranslate) throw new Error('翻译文本为空');
-
         const translator = TRANSLATORS[targetPanel.translatorKey];
         if (!translator) throw new Error('未找到指定的翻译器');
+
+        const textToTranslate = translator.normalize(text.replace(/\r\n?/g, '\n').trim());
+        if (!textToTranslate) throw new Error('翻译文本为空');
 
         targetPanel.translationText = textToTranslate;
         const requestId = ++targetPanel.requestId;
@@ -1538,7 +1404,7 @@
 
             const content = targetPanel.querySelector('.content');
             if (!content) throw new Error('未找到内容容器元素');
-            content.innerHTML = buildContentHTML(textToTranslate, result.html);
+            content.innerHTML = buildContentHTML(textToTranslate, result.html, targetPanel.translatorKey);
             requestAnimationFrame(() => utils.fitPanelToViewport(targetPanel));
 
             if (targetPanel.highlightRange && !isHighlightValid(targetPanel.highlightRange)) {
@@ -1601,7 +1467,7 @@
         targetPanel.highlightRange = highlightRange;
         targetPanel.innerHTML = buildPanelHTML(translatorKey);
         if (translationText && resultHtml) {
-            targetPanel.querySelector('.content').innerHTML = buildContentHTML(translationText, resultHtml);
+            targetPanel.querySelector('.content').innerHTML = buildContentHTML(translationText, resultHtml, translatorKey);
         }
         setHighlightButton(targetPanel, Boolean(highlightRange));
         setupPanelEvents(targetPanel);
@@ -1610,14 +1476,37 @@
 
     function containingHighlight(range) {
         return Array.from(highlightStore.keys()).find(source => isHighlightValid(source)
+            && source.startContainer.getRootNode() === range.startContainer.getRootNode()
             && source.compareBoundaryPoints(Range.START_TO_START, range) <= 0
             && source.compareBoundaryPoints(Range.END_TO_END, range) >= 0) || null;
     }
 
-    function selectionIsCurrent(snapshot) {
+    // 只使用本次鼠标事件路径中的 shadow roots，不扫描页面或穿透 closed roots。
+    function readSelectionRange(roots = []) {
         const selection = window.getSelection();
-        if (snapshot.epoch !== selectionEpoch || selection?.rangeCount !== 1) return false;
-        const current = selection.getRangeAt(0);
+        if (!selection) return null;
+        let source;
+        if (selection.getComposedRanges) {
+            const ranges = selection.getComposedRanges({shadowRoots: roots});
+            if (ranges.length !== 1) return null;
+            source = ranges[0];
+        } else {
+            const scoped = roots.find(root => typeof root.getSelection === 'function')?.getSelection() || selection;
+            if (scoped.rangeCount !== 1) return null;
+            source = scoped.getRangeAt(0);
+        }
+        if (source.startContainer.getRootNode() !== source.endContainer.getRootNode()) return null;
+        const range = document.createRange();
+        range.setStart(source.startContainer, source.startOffset);
+        range.setEnd(source.endContainer, source.endOffset);
+        return range.collapsed ? null : range;
+    }
+
+    function selectionIsCurrent(snapshot) {
+        if (snapshot.epoch !== selectionEpoch) return false;
+        const current = readSelectionRange(snapshot.roots);
+        if (!current) return false;
+        if (current.startContainer.getRootNode() !== snapshot.selectedRange.startContainer.getRootNode()) return false;
         return current.toString() === snapshot.rawText
             && current.compareBoundaryPoints(Range.START_TO_START, snapshot.selectedRange) === 0
             && current.compareBoundaryPoints(Range.END_TO_END, snapshot.selectedRange) === 0
@@ -1646,11 +1535,52 @@
         }
     }
 
+    // Range.toString() 不保留块级段落边界；只遍历选区内的节点构造查询副本。
+    function googleSelectionText(range) {
+        const root = range.commonAncestorContainer;
+        if (root.nodeType === Node.TEXT_NODE) return normalizeGoogleText(range.toString());
+        const styles = new Map();
+        const style = element => {
+            if (!styles.has(element)) styles.set(element, getComputedStyle(element));
+            return styles.get(element);
+        };
+        const paragraphOf = node => {
+            for (let element = node.parentElement; element; element = element.parentElement) {
+                if (!/^(inline(?:-block|-flex|-grid)?|contents)$/.test(style(element).display)) return element;
+            }
+            return root;
+        };
+        const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+            acceptNode: node => {
+                if (!range.intersectsNode(node)) return NodeFilter.FILTER_REJECT;
+                if (node.nodeType === Node.ELEMENT_NODE && (node.matches('script, style, template, noscript, input, textarea, select')
+                    || style(node).display === 'none' || style(node).visibility === 'hidden')) return NodeFilter.FILTER_REJECT;
+                return NodeFilter.FILTER_ACCEPT;
+            }
+        });
+        const parts = [];
+        let node, previousParagraph;
+        while ((node = walker.nextNode())) {
+            if (node.nodeType === Node.ELEMENT_NODE) {
+                if (node.tagName === 'BR') parts.push('\n\n');
+                continue;
+            }
+            const text = node.data.slice(node === range.startContainer ? range.startOffset : 0,
+                node === range.endContainer ? range.endOffset : node.length);
+            if (text.trim()) {
+                const paragraph = paragraphOf(node);
+                if (previousParagraph && previousParagraph !== paragraph) parts.push('\n\n');
+                previousParagraph = paragraph;
+            }
+            parts.push(text);
+        }
+        return normalizeGoogleText(parts.join(''));
+    }
+
     // 手势判定 → 选区快照 → 英文提取 → 请求/高亮，共用同一条处理链。
-    function captureTranslationSelection() {
-        const selection = window.getSelection();
-        if (!selection?.rangeCount || selection.isCollapsed || selection.rangeCount !== 1) return null;
-        const selectedRange = selection.getRangeAt(0).cloneRange();
+    function captureTranslationSelection(roots) {
+        const selectedRange = readSelectionRange(roots);
+        if (!selectedRange) return null;
         const editableNode = node => utils.isEditableTarget(
             node.nodeType === Node.TEXT_NODE ? node.parentElement : node
         );
@@ -1662,7 +1592,9 @@
         const range = sliceSelectionRange(selectedRange, prepared.start, prepared.end);
         if (!isCurrentRange(range, prepared.text)) return null;
         const sourceHighlight = translatorKey === 'google' ? null : containingHighlight(range);
-        return {translatorKey, bookmark: {range, text: prepared.text}, selectedRange, rawText,
+        const queryText = translatorKey === 'google' ? googleSelectionText(range) : prepared.text;
+        if (!queryText) return null;
+        return {translatorKey, bookmark: {range, text: prepared.text}, queryText, selectedRange, rawText, roots,
             epoch: selectionEpoch, sourceHighlight, sourceData: highlightStore.get(sourceHighlight)};
     }
 
@@ -1676,24 +1608,26 @@
             if (pendingRefine === snapshot) pendingRefine = null;
             return;
         }
-        if (sourceHighlight) return refineSelection(snapshot);
+        if (sourceHighlight && !(translatorKey === 'cambridge' && !CONFIG.enableCambridge)) return refineSelection(snapshot);
         const rect = bookmark.range.getBoundingClientRect();
 
-        cleanupPanels();
+        if (!sourceHighlight) cleanupPanels();
         const targetPanel = createTranslatorPanel({translatorKey});
         targetPanel.selectionBookmark = bookmark;
         document.body.appendChild(targetPanel);
         utils.showPanel(rect, targetPanel);
-        await translate(bookmark.text, targetPanel);
+        await translate(snapshot.queryText, targetPanel);
     }, CONFIG.triggerDelay);
 
     const eventHandlers = {
         handleMouseDown(e) {
+            const target = e.composedPath()[0];
             cancelSelection();
             state.selectionGesture = e.button === 0 ? {
                 startedAt: e.timeStamp, x: e.clientX, y: e.clientY, clickCount: e.detail,
-                startedInPanel: utils.isClickInPanel(e), startedInEditable: utils.isEditableTarget(e.target),
-                sourceHighlight: highlightAtPoint(e.clientX, e.clientY, e.target)
+                startedInPanel: utils.isClickInPanel(e), startedInEditable: utils.isEditableTarget(target),
+                roots: e.composedPath().filter(node => node instanceof ShadowRoot && node.mode === 'open'),
+                sourceHighlight: highlightAtPoint(e.clientX, e.clientY, target)
             } : null;
             if (state.selectionGesture?.sourceHighlight) {
                 cancelHoverTimers();
@@ -1721,7 +1655,7 @@
                 return;
             }
             if (state.isRightClickPending && e.button === 0) {
-                document.querySelectorAll('.translator-panel:not(.pinned)').forEach(utils.hidePanel);
+                utils.hideUnpinned();
                 state.isRightClickPending = false;
                 cancelSelection();
                 return;
@@ -1730,7 +1664,7 @@
                 state.isRightClickPending = false;
                 return;
             }
-            if (utils.isClickInPanel(e) || gesture?.startedInEditable || utils.isEditableTarget(e.target)) {
+            if (utils.isClickInPanel(e) || gesture?.startedInEditable || utils.isEditableTarget(e.composedPath()[0])) {
                 cancelSelection();
                 return;
             }
@@ -1739,7 +1673,9 @@
             const heldMs = e.timeStamp - gesture.startedAt;
             const moved = Math.hypot(e.clientX - gesture.x, e.clientY - gesture.y);
             if (!doubleClick && (heldMs < CONFIG.selectionMinHoldMs || moved < CONFIG.selectionMinDistance)) return;
-            const snapshot = captureTranslationSelection();
+            const roots = [...new Set([...gesture.roots,
+                ...e.composedPath().filter(node => node instanceof ShadowRoot && node.mode === 'open')])];
+            const snapshot = captureTranslationSelection(roots);
             if (snapshot?.sourceHighlight) {
                 pendingRefine = snapshot;
                 cancelHoverTimers();
@@ -1752,19 +1688,19 @@
                 return;
             }
             if (state.isRightClickPending || dragState || utils.isClickInPanel(e) || refineLocked()) return;
-            document.querySelectorAll('.translator-panel:not(.pinned)').forEach(utils.hidePanel);
+            utils.hideUnpinned();
         }
     };
 
-    window.addEventListener('blur', () => {
+    on(window, 'blur', () => {
         cancelSelection();
         state.selectionGesture = null;
     });
 
-    document.addEventListener('mousedown', eventHandlers.handleMouseDown, {capture: true, passive: false});
-    document.addEventListener('mouseup', eventHandlers.handleMouseUp, {capture: true, passive: false});
-    document.addEventListener('click', eventHandlers.handleOutsideClick, {capture: true, passive: false});
-    document.addEventListener('contextmenu', e => {
+    on(document, 'mousedown', eventHandlers.handleMouseDown, {capture: true, passive: false});
+    on(document, 'mouseup', eventHandlers.handleMouseUp, {capture: true, passive: false});
+    on(document, 'click', eventHandlers.handleOutsideClick, {capture: true, passive: false});
+    on(document, 'contextmenu', e => {
         if (!(e.target instanceof Element) || !e.target.closest('.translator-panel')) {
             state.isRightClickPending = true;
         }
@@ -1773,8 +1709,9 @@
     // 共用命中与过渡入口，每帧最多测量一次文字矩形。
     let hoverFrame = null;
     let hoverPoint = null;
-    document.addEventListener('mousemove', e => {
-        hoverPoint = {x: e.clientX, y: e.clientY, target: e.target, buttons: e.buttons};
+    on(document, 'mousemove', e => {
+        if (!highlightStore.size) return;
+        hoverPoint = {x: e.clientX, y: e.clientY, target: e.composedPath()[0], buttons: e.buttons};
         if (hoverFrame !== null) return;
         hoverFrame = requestAnimationFrame(() => {
             hoverFrame = null;
@@ -1782,31 +1719,15 @@
             if (!buttons && !dragState && !state.selectionGesture) updateHoverTarget(x, y, target);
         });
     }, {passive: true});
-    document.addEventListener('mouseleave', () => {
+    on(document, 'mouseleave', () => {
         hoverHighlights?.clear();
         scheduleHideHover();
     });
 
-    // 流式回复、SPA 切页后丢弃失效 Range，避免残留词表和引用。
-    const pruneHighlights = utils.debounce(() => {
-        let changed = false;
-        for (const range of highlightStore.keys()) {
-            if (!isHighlightValid(range)) {
-                removeHighlight(range, false);
-                changed = true;
-            }
-        }
-        if (changed) updateWordbookUI();
-    }, 200);
-    new MutationObserver(records => {
-        if (highlightStore.size && records.some(record => {
-            const element = record.target.nodeType === Node.TEXT_NODE ? record.target.parentElement : record.target;
-            return !element?.closest?.('.translator-panel, .popdict-wordbook-button');
-        })) pruneHighlights();
-    }).observe(document.body, {childList: true, subtree: true, characterData: true});
+    // 失效高亮在用户下次操作词表/选词时清理，不后台监听页面内容变化。
 
     function refreshOpenDropdowns() {
-        document.querySelectorAll('.translator-panel').forEach(panel => panel.refreshDropdown?.());
+        panels().forEach(panel => panel.refreshDropdown?.());
     }
 
     function setupTranslatorSwitch(targetPanel) {
@@ -1858,16 +1779,16 @@
             }
         };
 
-        targetPanel.addEventListener('click', e => {
+        on(targetPanel, 'click', e => {
             if (!e.target.closest('.title-wrapper') && targetPanel.isDropdownOpen) toggleDropdown(false);
         });
 
-        titleWrapper.addEventListener('click', e => {
+        on(titleWrapper, 'click', e => {
             utils.stopEvent(e);
             toggleDropdown(!targetPanel.isDropdownOpen);
         });
 
-        dropdownMenu.addEventListener('click', e => {
+        on(dropdownMenu, 'click', e => {
             utils.stopEvent(e);
             const item = e.target.closest('.dropdown-item');
             if (!item) return;
@@ -1889,8 +1810,8 @@
             updateDropdownMenu();
         });
 
-        targetPanel.addEventListener('mouseenter', () => clearTimeout(targetPanel.dropdownCloseTimer));
-        targetPanel.addEventListener('mouseleave', () => {
+        on(targetPanel, 'mouseenter', () => clearTimeout(targetPanel.dropdownCloseTimer));
+        on(targetPanel, 'mouseleave', () => {
             targetPanel.dropdownCloseTimer = setTimeout(() => toggleDropdown(false), 100);
         });
     }
@@ -1915,7 +1836,7 @@
     }
 
     // 所有窗口共用一组文档级拖动监听器，避免新窗口覆盖旧窗口的监听器。
-    document.addEventListener('mousemove', e => {
+    on(document, 'mousemove', e => {
         if (!dragState) return;
         const {panel, startX, startY, startLeft, startTop, scrollX, scrollY} = dragState;
         if (!panel.isConnected) {
@@ -1940,13 +1861,17 @@
     });
 
     function setupPanelEvents(targetPanel) {
+        // toggle 不冒泡；只调整本面板位置，不触发查询。
+        targetPanel.addEventListener('toggle', e => {
+            if (e.target.matches('.source-preview')) utils.fitPanelToViewport(targetPanel);
+        }, true);
         setupTranslatorSwitch(targetPanel);
         updateThemeButton(targetPanel.querySelector('.theme-button'), utils.isDarkMode());
         updatePinButton(targetPanel.querySelector('.pin-button'), targetPanel.classList.contains('pinned'));
 
         // 面板按钮共用事件入口，动作类保留各自的职责。
-        targetPanel.addEventListener('click', e => {
-            const button = e.target.closest('.icon-button, .audio-button');
+        on(targetPanel, 'click', e => {
+            const button = e.target.closest('.icon-button, .audio-button, .cambridge-open');
             if (!button) return;
             utils.stopEvent(e);
             cancelSelection();
@@ -1955,9 +1880,9 @@
                 if (button.dataset.url) audio.play(button.dataset.url);
             } else if (button.classList.contains('unhighlight-button')) {
                 removeHighlight(targetPanel.highlightRange);
-            } else if (button.classList.contains('external-button')) {
+            } else if (button.classList.contains('external-button') || button.classList.contains('cambridge-open')) {
                 const url = EXTERNAL_URLS[targetPanel.translatorKey];
-                if (url && targetPanel.translationText) window.open(url + encodeURIComponent(targetPanel.translationText), '_blank');
+                if (url && targetPanel.translationText) window.open(url + encodeURIComponent(targetPanel.translationText), '_blank', 'noopener,noreferrer');
             } else if (button.classList.contains('pin-button')) {
                 const pinned = targetPanel.classList.toggle('pinned');
                 updatePinButton(button, pinned);
@@ -1970,7 +1895,7 @@
                 utils.toggleDarkMode();
             } else if (button.classList.contains('clear-button')) {
                 hideHoverPanel();
-                document.querySelectorAll('.translator-panel').forEach(panel => utils.hidePanel(panel, true));
+                panels().forEach(panel => utils.hidePanel(panel, true));
                 wordbookPanel = null;
                 dragState?.panel.classList.remove('dragging');
                 dragState = null;
@@ -1980,9 +1905,9 @@
             }
         });
 
-        targetPanel.addEventListener('mousedown', e => {
+        on(targetPanel, 'mousedown', e => {
             const inContent = e.target.closest('.content');
-            if (inContent && !e.target.closest('.audio-button')) {
+            if (inContent && !e.target.closest('button, summary')) {
                 if (e.detail < 3) {
                     state.isSelectingInPanel = true;
                     document.body.style.userSelect = 'none';
@@ -1993,33 +1918,31 @@
             beginPanelDrag(e, targetPanel);
         });
 
-        targetPanel.addEventListener('mousemove', e => {
+        on(targetPanel, 'mousemove', e => {
             if (state.isSelectingInPanel) e.stopPropagation();
         });
 
-        targetPanel.addEventListener('contextmenu', e => {
+        on(targetPanel, 'contextmenu', e => {
             const selection = window.getSelection();
             if (selection?.isCollapsed || !e.target.closest('.content')) {
                 utils.stopEvent(e);
-                document.querySelectorAll('.translator-panel:not(.pinned)').forEach(utils.hidePanel);
+                utils.hideUnpinned();
             }
         });
     }
 
     // 浏览器窗口尺寸变化时，重新限制所有翻译窗口的高度和位置。
-    window.addEventListener('resize', utils.debounce(() => {
-        document.querySelectorAll('.translator-panel:not(.dragging):not(.popdict-wordbook-panel)').forEach(panel => {
-            utils.fitPanelToViewport(panel);
-        });
+    on(window, 'resize', utils.debounce(() => {
+        floatingPanels().forEach(panel => utils.fitPanelToViewport(panel));
     }, 100));
 
     // 页面滚动后，仅在窗口完全离开视口时将其拉回可见区域。
     let scrollTimer = null;
-    window.addEventListener('scroll', () => {
+    on(window, 'scroll', () => {
         if (scrollTimer) return;
         scrollTimer = setTimeout(() => {
             scrollTimer = null;
-            document.querySelectorAll('.translator-panel:not(.dragging):not(.popdict-wordbook-panel)').forEach(panel => {
+            floatingPanels().forEach(panel => {
                 if (!panel.isConnected || panel.classList.contains('closing') || panel.style.display === 'none') return;
                 const rect = panel.getBoundingClientRect();
                 const outside = rect.right < CONFIG.panelSpacing
@@ -2032,4 +1955,6 @@
             });
         }, 100);
     }, {passive: true});
+    eventHandlers.handleMouseDown(firstEvent);
+    }
 })();
